@@ -23,6 +23,7 @@ defined.
 import os
 from tkinter import messagebox
 
+from Comparativos import HOJA_COMPARATIVO_AGRUPADOR, HOJA_COMPARATIVO_BU
 from Consolidacion import HOJA_VARIACIONES, construir_variaciones
 from Poliza_SAP import HOJA_CREACIONES, generar_poliza_sap
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
@@ -98,7 +99,10 @@ class ReservasController:
             f"¿Generar la pestaña '{HOJA_VARIACIONES}'?\n\n"
             f"  📄 Archivo : {os.path.basename(ruta_libro)}\n"
             f"  📅 Compara : {anterior} vs {actual}\n"
-            f"               ({etiqueta_mes_es(anterior)} vs {etiqueta_mes_es(actual)})\n\n"
+            f"               ({etiqueta_mes_es(anterior)} vs {etiqueta_mes_es(actual)})\n"
+            f"  📊 Además  : '{HOJA_COMPARATIVO_BU}' y\n"
+            f"               '{HOJA_COMPARATIVO_AGRUPADOR}'\n"
+            f"               (tablas dinámicas: año pasado arriba, año actual abajo)\n\n"
             f"Se trabajará sobre una COPIA en la subcarpeta 'Output',\n"
             f"así que el archivo original no se toca."
         )
@@ -263,6 +267,8 @@ class ReservasController:
             f"  • Σ {resumen['mes_actual']}        : {resumen['total_actual']:,.2f}"
         )
 
+        texto += ReservasController._texto_comparativos(resumen)
+
         no_mapeados = resumen.get("conceptos_no_mapeados") or []
         if no_mapeados:
             mostrados = no_mapeados[:MAX_NO_MAPEADOS_EN_POPUP]
@@ -287,6 +293,57 @@ class ReservasController:
         return texto
 
     @staticmethod
+    def _texto_comparativos(resumen):
+        """
+        Build the PivotTable half of the 'Variaciones' popup.
+
+        Three outcomes, and the popup has to tell them apart: the pivots were
+        built, the pivots were skipped on purpose, or the pivots failed. The
+        third one is NOT an error dialog — the 'Variaciones' sheet is already
+        saved — but it must not be silent either, or somebody opens the file
+        looking for two sheets that are not there.
+        """
+        error = resumen.get("comparativos_error")
+        if error:
+            return (
+                f"\n\n⚠️ Las tablas dinámicas comparativas NO se crearon:\n"
+                f"{error}\n"
+                f"La pestaña 'Variaciones' sí quedó lista en el archivo de arriba.\n"
+                f"(Ese paso necesita Excel instalado y el archivo cerrado.)"
+            )
+
+        comparativos = resumen.get("comparativos")
+        if not comparativos:
+            return ""
+
+        lineas = []
+        for tabla in comparativos["tablas"]:
+            if tabla["tabla"] is None:
+                lineas.append(
+                    f"     • {tabla['hoja']} — {tabla['anio']}: sin movimientos"
+                )
+            else:
+                meses = tabla["meses"]
+                total = tabla["total"]
+                lineas.append(
+                    f"     • {tabla['hoja']} — {tabla['anio']}: "
+                    f"{len(meses)} mes(es) ({meses[0]}–{meses[-1]})"
+                    + (f", Σ {total:,.2f}" if total is not None else "")
+                )
+
+        texto = (
+            f"\n\n📊 Tablas dinámicas creadas "
+            f"({comparativos['anio_anterior']} arriba / "
+            f"{comparativos['anio_actual']} abajo):\n"
+            + "\n".join(lineas)
+        )
+
+        for aviso in comparativos.get("advertencias") or []:
+            texto += f"\n     ⚠️ {aviso}"
+
+        return texto
+
+    @staticmethod
     def _texto_poliza(resumen):
         """
         Build the 'PÓLIZA SAP' popup text.
@@ -301,16 +358,13 @@ class ReservasController:
         texto = (
             f"Archivo generado:\n{resumen['ruta']}\n\n"
             f"  • Pestaña          : {resumen['hoja']}\n"
-            f"  • Encabezado en    : fila {resumen['fila_encabezado']}\n"
             f"  • Filas escritas   : {resumen['filas']:,} "
             f"(filas {resumen['fila_inicio']}–{resumen['fila_fin']})\n"
             f"  • Columnas         :\n{columnas}\n"
             f"  • Σ columna {resumen['columna_control']} (MONTO) : "
             f"{resumen['total_control']:,.2f}\n"
-            f"  • Fórmulas         : "
-            + ("congeladas a valores" if resumen["convertido_a_valores"]
-               else "vivas (se recalculan solas)")
-        )
+            )
+        
 
         errores = resumen.get("errores") or []
         if errores:

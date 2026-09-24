@@ -36,6 +36,13 @@ Amounts in B and D are pasted as VALUES (already summed in pandas). Everything
 else is written as a LIVE FORMULA, exactly like the sheet the stakeholder
 maintains by hand, so that editing B or D keeps the block consistent.
 
+After 'Variaciones' is written and saved, construir_variaciones() hands the file
+to Comparativos.py, which adds two more sheets ('Comparativo BU Mes' and
+'Comparativo Agrupador Mes') holding four REAL Excel PivotTables. That step
+needs Excel + pywin32 and therefore runs LAST and OPTIONALLY: if it fails, the
+'Variaciones' sheet is already on disk and the run reports the pivots as
+skipped instead of losing a good consolidation.
+
 This module does NOT depend on SAP or tkinter: it can be tested on its own with
 `python Consolidacion.py`.
 """
@@ -163,6 +170,12 @@ ANCHOS_COLUMNA = {
 # Add the variance / index formulas to the 'Grand Total' row too. The hand-made
 # sheet leaves G and H empty on that row; set to False to match it exactly.
 TOTAL_INCLUYE_VARIACION = True
+
+# Also build the two PivotTable sheets ('Comparativo BU Mes' and 'Comparativo
+# Agrupador Mes') once 'Variaciones' is saved. They are real Excel PivotTables,
+# so they need Excel + pywin32 on the machine; set to False to skip them on a
+# machine without Excel (or while testing the matrices on their own).
+CONSTRUIR_COMPARATIVOS = True
 
 
 # ----------------------------------------------------------------------
@@ -716,6 +729,7 @@ def construir_variaciones(
     mes=None,
     grupos=None,
     sobrescribir_original=False,
+    con_comparativos=None,
     callback_status=None,
 ):
     """
@@ -733,6 +747,8 @@ def construir_variaciones(
             Default False — it writes a copy, because openpyxl cannot preserve
             everything a hand-maintained workbook carries (see the note in the
             project README).
+        con_comparativos (bool|None): also build the two PivotTable sheets.
+            None -> the CONSTRUIR_COMPARATIVOS flag.
         callback_status (function|None): progress reporting for the GUI.
 
     Returns:
@@ -741,6 +757,9 @@ def construir_variaciones(
     def update_status(mensaje):
         if callback_status:
             callback_status(mensaje)
+
+    if con_comparativos is None:
+        con_comparativos = CONSTRUIR_COMPARATIVOS
 
     clave_anterior, clave_actual = claves_mes_actual_y_anterior(mes)
     update_status(
@@ -778,6 +797,29 @@ def construir_variaciones(
     wb.save(ruta_final)
     wb.close()
 
+    # --- Optional second pass: the two PivotTable sheets ---------------
+    # Runs AFTER openpyxl has saved and closed, never before: openpyxl would
+    # have to round-trip a brand new pivot cache, and that is exactly the kind
+    # of part it does not know how to write back.
+    comparativos, comparativos_error = None, None
+    if con_comparativos:
+        try:
+            # Imported HERE, not at the top of the file, so this module keeps
+            # importing fine on a machine with no Excel / no pywin32 — the same
+            # trick Poliza_SAP.py uses for its own COM imports.
+            from Comparativos import construir_comparativos
+
+            comparativos = construir_comparativos(
+                ruta_final, mes=mes, callback_status=callback_status,
+            )
+        except Exception as e:
+            # Deliberately broad. At this point 'Variaciones' is already written
+            # and saved on disk; a missing Excel, a COM hiccup or a locked file
+            # must downgrade to a warning in the summary, not throw away a good
+            # consolidation. The controller shows the message.
+            comparativos_error = str(e)
+            update_status(f"⚠️ No pude crear las tablas dinámicas: {e}")
+
     update_status("✅ Consolidación completada")
 
     return {
@@ -794,6 +836,10 @@ def construir_variaciones(
         # visible instead of buried inside a total.
         "mapeo_conceptos":  reporte,
         "conceptos_no_mapeados": no_mapeados,
+        # Summary of the PivotTable pass (None if it was skipped) and the reason
+        # it did not run, if it failed.
+        "comparativos":         comparativos,
+        "comparativos_error":   comparativos_error,
         "analistas_sin_bloque": sorted(
             set(df["_analista"].unique())
             - {_normalizar(a) for g in (grupos or GRUPOS) for a in g["analistas"]}

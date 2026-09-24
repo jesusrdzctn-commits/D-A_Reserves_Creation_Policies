@@ -58,10 +58,16 @@ Excel calculate -> report every #N/A -> freeze the results as values -> save.
 
 import os
 import shutil
-import unicodedata
 from datetime import datetime
 
+# The COM plumbing lives in utils.py because 'Comparativos' needs the very same
+# four helpers. Aliased to the private names this module already used, so every
+# call site below stays exactly as it was.
+from utils import abrir_excel as _abrir_excel
 from utils import carpeta_output_desde_input
+from utils import cerrar_excel as _cerrar_excel
+from utils import hoja_por_nombre as _hoja
+from utils import norm_texto as _norm
 
 # ----------------------------------------------------------------------
 # Excel COM constants
@@ -210,102 +216,11 @@ MAX_ERRORES_REPORTADOS = 10
 
 
 # ======================================================================
-# Small helpers
+# Layout helpers
 # ======================================================================
-def _norm(texto):
-    """Trim, upper-case and drop accents, tolerating None. 'Cebe' -> 'CEBE'."""
-    if texto is None:
-        return ""
-    limpio = unicodedata.normalize("NFKD", str(texto))
-    limpio = limpio.encode("ascii", "ignore").decode("ascii")
-    return " ".join(limpio.upper().split())
-
-
-# ======================================================================
-# Excel COM plumbing
-# ======================================================================
-def _abrir_excel():
-    """
-    Start a PRIVATE Excel instance and return (app, pythoncom).
-
-    DispatchEx, not Dispatch, and this is the single most important line in the
-    module. Dispatch attaches to the Excel the user already has open; when we
-    later call app.Quit() we would be closing THEIR workbooks with our own.
-    DispatchEx always starts a brand new, invisible instance that is ours to
-    kill. Different kitchen, same recipe.
-    """
-    try:
-        import pythoncom
-        import win32com.client as win32
-    except ImportError:
-        raise RuntimeError(
-            "Este proceso necesita 'pywin32' y Excel instalado (el archivo es "
-            ".xlsb y sólo Excel lo abre de forma nativa).\n\n"
-            "Instálalo con:   pip install pywin32"
-        )
-
-    pythoncom.CoInitialize()
-
-    app = win32.DispatchEx("Excel.Application")
-    app.Visible          = False
-    app.DisplayAlerts    = False   # no 'do you want to save?' pop-ups
-    app.ScreenUpdating   = False   # much faster without redrawing
-    app.AskToUpdateLinks = False   # external links never block the run
-    app.EnableEvents     = False   # the workbook's own macros stay quiet
-
-    return app, pythoncom
-
-
-def _cerrar_excel(app, wb, pythoncom):
-    """
-    Close everything, in order, never raising. Called from a `finally`, so if it
-    blew up it must not blow up AGAIN and hide the real error. A leaked EXCEL.EXE
-    keeps the file locked and the next run fails with a confusing message.
-    """
-    try:
-        if wb is not None:
-            wb.Close(SaveChanges=False)
-    except Exception:
-        pass
-    try:
-        if app is not None:
-            app.CutCopyMode = False
-            app.ScreenUpdating = True
-            app.EnableEvents = True
-            app.Quit()
-    except Exception:
-        pass
-    try:
-        if pythoncom is not None:
-            pythoncom.CoUninitialize()
-    except Exception:
-        pass
-
-
-def _hoja(wb, nombre):
-    """
-    Find a sheet by name: EXACT match first, loose match (case/accent
-    insensitive) only as a fallback.
-
-    The exact pass is not paranoia — this workbook really does carry both
-    'catalogo' and 'Catálogo', and they are different tables. A loose-first
-    match could grab the wrong one and every VLOOKUP would quietly return
-    garbage instead of failing.
-    """
-    for ws in wb.Worksheets:
-        if str(ws.Name) == nombre:
-            return ws
-
-    objetivo = _norm(nombre)
-    for ws in wb.Worksheets:
-        if _norm(ws.Name) == objetivo:
-            return ws
-
-    disponibles = [str(ws.Name) for ws in wb.Worksheets]
-    raise ValueError(
-        f"El libro no tiene una pestaña llamada '{nombre}'.\n\n"
-        f"Pestañas encontradas: {disponibles}"
-    )
+# _norm, _abrir_excel, _cerrar_excel and _hoja used to live here; they now
+# come from utils.py so 'Comparativos' can reuse them (see the imports at
+# the top). Everything below is specific to the 'PÓLIZA SAP' section.
 
 
 def _localizar_fila_encabezado(ws):

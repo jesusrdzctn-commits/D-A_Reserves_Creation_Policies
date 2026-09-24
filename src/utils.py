@@ -12,9 +12,18 @@ process: the 'Mes' column of the 'Base' sheet is written as 'M06-26'
 
 Golden rule: if the month key format ever changes, this file is touched and
 nothing else.
+
+It is also where the Excel COM plumbing lives (abrir_excel / cerrar_excel /
+hoja_por_nombre / norm_texto), for the same reason
+carpeta_output_desde_input() moved here: TWO processes need it now
+('PÓLIZA SAP' and 'Comparativos'), and importing one of them from the other
+would drag a whole module along just to reuse four helpers. win32com is
+imported INSIDE abrir_excel(), so this file still imports cleanly on a machine
+with no Excel — only actually using it fails, and with a readable message.
 """
 
 import os
+import unicodedata
 from datetime import datetime
 
 # Month key as written in the 'Mes' column of the 'Base' sheet: 'M06-26'.
@@ -122,6 +131,101 @@ def carpeta_output_desde_input(ruta_input):
     if os.path.basename(ruta).lower() == "input":
         return os.path.join(os.path.dirname(ruta), "Output")
     return os.path.join(ruta, "Output")
+
+
+# ----------------------------------------------------------------------
+# Excel COM plumbing (shared by Poliza_SAP.py and Comparativos.py)
+# ----------------------------------------------------------------------
+def norm_texto(texto):
+    """Trim, upper-case and drop accents, tolerating None. 'Cebe' -> 'CEBE'."""
+    if texto is None:
+        return ""
+    limpio = unicodedata.normalize("NFKD", str(texto))
+    limpio = limpio.encode("ascii", "ignore").decode("ascii")
+    return " ".join(limpio.upper().split())
+
+
+def abrir_excel():
+    """
+    Start a PRIVATE Excel instance and return (app, pythoncom).
+
+    DispatchEx, not Dispatch, and this is the single most important line in the
+    COM layer. Dispatch attaches to the Excel the user already has open; when we
+    later call app.Quit() we would be closing THEIR workbooks with our own.
+    DispatchEx always starts a brand new, invisible instance that is ours to
+    kill. Different kitchen, same recipe.
+    """
+    try:
+        import pythoncom
+        import win32com.client as win32
+    except ImportError:
+        raise RuntimeError(
+            "Este proceso necesita 'pywin32' y Excel instalado.\n\n"
+            "Instálalo con:   pip install pywin32"
+        )
+
+    pythoncom.CoInitialize()
+
+    app = win32.DispatchEx("Excel.Application")
+    app.Visible          = False
+    app.DisplayAlerts    = False   # no 'do you want to save?' pop-ups
+    app.ScreenUpdating   = False   # much faster without redrawing
+    app.AskToUpdateLinks = False   # external links never block the run
+    app.EnableEvents     = False   # the workbook's own macros stay quiet
+
+    return app, pythoncom
+
+
+def cerrar_excel(app, wb, pythoncom):
+    """
+    Close everything, in order, never raising. Called from a `finally`, so if it
+    blew up it must not blow up AGAIN and hide the real error. A leaked EXCEL.EXE
+    keeps the file locked and the next run fails with a confusing message.
+    """
+    try:
+        if wb is not None:
+            wb.Close(SaveChanges=False)
+    except Exception:
+        pass
+    try:
+        if app is not None:
+            app.CutCopyMode = False
+            app.ScreenUpdating = True
+            app.EnableEvents = True
+            app.Quit()
+    except Exception:
+        pass
+    try:
+        if pythoncom is not None:
+            pythoncom.CoUninitialize()
+    except Exception:
+        pass
+
+
+def hoja_por_nombre(wb, nombre):
+    """
+    Find a sheet by name: EXACT match first, loose match (case/accent
+    insensitive) only as a fallback.
+
+    The exact pass is not paranoia — the WHSL workbook really does carry both
+    'catalogo' and 'Catálogo', and they are different tables. A loose-first
+    match could grab the wrong one and every VLOOKUP would quietly return
+    garbage instead of failing.
+    """
+    for ws in wb.Worksheets:
+        if str(ws.Name) == nombre:
+            return ws
+
+    objetivo = norm_texto(nombre)
+    for ws in wb.Worksheets:
+        if norm_texto(ws.Name) == objetivo:
+            return ws
+
+    disponibles = [str(ws.Name) for ws in wb.Worksheets]
+    raise ValueError(
+        f"El libro no tiene una pestaña llamada '{nombre}'.\n\n"
+        f"Pestañas encontradas: {disponibles}"
+    )
 
 
 # ----------------------------------------------------------------------

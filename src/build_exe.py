@@ -14,6 +14,7 @@ ARCHIVOS_REQUERIDOS = [
     "interfaz_GUI.py",
     "controller.py",
     "Consolidacion.py",
+    "Comparativos.py",
     "Poliza_SAP.py",
     "utils.py",
 ]
@@ -68,14 +69,19 @@ def create_executable():
         "--hidden-import=openpyxl.cell._writer",
         "--hidden-import=pandas",
 
-        # Proceso 2 ('PÓLIZA SAP') — maneja el .xlsb con Excel COM.
-        # PyInstaller no rastrea estos imports porque Poliza_SAP.py los hace
-        # DENTRO de la función (a propósito: así el módulo se puede importar en
-        # una máquina sin Excel y sólo truena si de verdad se usa el botón).
+        # Proceso 2 ('PÓLIZA SAP') y las tablas dinámicas comparativas — los dos
+        # manejan Excel por COM. PyInstaller no rastrea estos imports porque
+        # utils.abrir_excel() los hace DENTRO de la función (a propósito: así el
+        # módulo se puede importar en una máquina sin Excel y sólo truena si de
+        # verdad se usa el botón).
         "--hidden-import=win32com",
         "--hidden-import=win32com.client",
         "--hidden-import=pythoncom",
         "--hidden-import=pywintypes",
+
+        # Consolidacion.py importa Comparativos DENTRO de la función, por la
+        # misma razón. Se declara por si el análisis de PyInstaller no lo ve.
+        "--hidden-import=Comparativos",
 
         # Punto de entrada
         "main.py",
