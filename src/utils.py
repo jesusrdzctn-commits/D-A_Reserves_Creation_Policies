@@ -4,7 +4,7 @@ RDA Pólizas D&A — utils.py
 
 Shared helpers with NO dependency on SAP or tkinter, so that:
   - the GUI can import them and still be openable/testable on its own, and
-  - the consolidation layer can import them without duplicating logic.
+  - the consolidation layers can import them without duplicating logic.
 
 This is the SINGLE SOURCE OF TRUTH for the month key used across the whole
 process: the 'Mes' column of the 'Base' sheet is written as 'M06-26'
@@ -14,6 +14,7 @@ Golden rule: if the month key format ever changes, this file is touched and
 nothing else.
 """
 
+import os
 from datetime import datetime
 
 # Month key as written in the 'Mes' column of the 'Base' sheet: 'M06-26'.
@@ -101,6 +102,29 @@ def etiqueta_mes_es(clave):
 
 
 # ----------------------------------------------------------------------
+# Output folder
+# ----------------------------------------------------------------------
+def carpeta_output_desde_input(ruta_input):
+    """
+    Return the 'Output' folder that sits next to the input folder.
+
+    Same convention as Validación Factura Global: if the chosen folder is named
+    'Input' the Output lands BESIDE it (src/Output); for any other folder the
+    Output is created INSIDE it, so nothing is scattered outside the user's
+    choice.
+
+    Lives here rather than in a consolidation module because BOTH processes
+    ('Variaciones' and 'PÓLIZA SAP') need it, and importing one consolidation
+    module from the other would drag pandas and openpyxl into a process that
+    only talks to Excel COM.
+    """
+    ruta = os.path.normpath(ruta_input)
+    if os.path.basename(ruta).lower() == "input":
+        return os.path.join(os.path.dirname(ruta), "Output")
+    return os.path.join(ruta, "Output")
+
+
+# ----------------------------------------------------------------------
 # Quick check:  python utils.py
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
@@ -108,3 +132,5 @@ if __name__ == "__main__":
     print("Corriendo jul26:", claves_mes_actual_y_anterior("M07-26"))
     print("Cruce de año   :", claves_mes_actual_y_anterior("M01-26"))
     print("Etiqueta       :", etiqueta_mes_es("M06-26"))
+    print("Output (Input) :", carpeta_output_desde_input(r"C:\RDA\Input"))
+    print("Output (otra)  :", carpeta_output_desde_input(r"C:\RDA\Reservas"))

@@ -52,7 +52,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from utils import claves_mes_actual_y_anterior, etiqueta_mes_es, parse_clave_mes
+from utils import carpeta_output_desde_input, claves_mes_actual_y_anterior, etiqueta_mes_es, parse_clave_mes
 
 # ----------------------------------------------------------------------
 # Sheets and source columns
@@ -201,21 +201,6 @@ def _relleno(rgb):
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-def carpeta_output_desde_input(ruta_input):
-    """
-    Return the 'Output' folder that sits next to the input folder.
-
-    Same convention as Validación Factura Global: if the chosen folder is named
-    'Input' the Output lands BESIDE it (src/Output); for any other folder the
-    Output is created INSIDE it, so nothing is scattered outside the user's
-    choice.
-    """
-    ruta = os.path.normpath(ruta_input)
-    if os.path.basename(ruta).lower() == "input":
-        return os.path.join(os.path.dirname(ruta), "Output")
-    return os.path.join(ruta, "Output")
-
-
 def _normalizar(texto):
     """Trim and upper-case, tolerating None. Used to match headers and values."""
     return str(texto).strip().upper() if texto is not None else ""
@@ -365,7 +350,7 @@ def emparejar_concepto(agrupador, catalogo=None, umbral=None):
                        'DESCUENTO ...' concepts apart, because each of them
                        needs its own second word to be present.
         3. 'fuzzy'   — character similarity above `umbral`, for typos only
-                       ('DIFERENENCIA EN PRECIO' -> 'DIFERENCIA EN PRECIO').
+                       ('DIFERENENCIA EN PRECIO' -> 'DIFERENCIA EN PRECIO').-
 
     Returns (None, 'sin match', mejor_score) when nothing clears the bar. The
     caller keeps those rows under their raw name instead of dropping them.

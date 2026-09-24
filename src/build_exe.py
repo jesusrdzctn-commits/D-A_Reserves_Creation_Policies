@@ -14,6 +14,7 @@ ARCHIVOS_REQUERIDOS = [
     "interfaz_GUI.py",
     "controller.py",
     "Consolidacion.py",
+    "Poliza_SAP.py",
     "utils.py",
 ]
 
@@ -27,6 +28,22 @@ def install_pyinstaller():
         print("📦 Instalando PyInstaller...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
         print("✅ PyInstaller instalado correctamente")
+
+
+def check_pywin32():
+    """
+    pywin32 es lo que le permite a Poliza_SAP.py manejar Excel (el archivo
+    WHSL es .xlsb y sólo Excel lo abre de forma nativa). Sin esto, el botón
+    de 'PÓLIZA SAP' truena en tiempo de ejecución, no al compilar.
+    """
+    try:
+        import win32com.client  # noqa: F401
+        print("✅ pywin32 ya está instalado")
+        return True
+    except ImportError:
+        print("⚠️  pywin32 NO está instalado — el proceso de 'PÓLIZA SAP' no funcionará")
+        print("    Instálalo con:  pip install pywin32")
+        return False
 
 
 def create_executable():
@@ -46,13 +63,19 @@ def create_executable():
         "--noconfirm",             # No pregunta al sobrescribir dist/ y build/
 
         # Módulos que PyInstaller no detecta solo.
-        # Nota: todavía NO se incluye win32com porque esta versión escribe el
-        # Excel con openpyxl. Cuando el escritor cambie a Excel COM, agregar:
-        #   --hidden-import=win32com  --hidden-import=win32com.client
-        #   --hidden-import=pywintypes
+        # Proceso 1 ('Variaciones') — escribe el .xlsx con openpyxl:
         "--hidden-import=openpyxl",
         "--hidden-import=openpyxl.cell._writer",
         "--hidden-import=pandas",
+
+        # Proceso 2 ('PÓLIZA SAP') — maneja el .xlsb con Excel COM.
+        # PyInstaller no rastrea estos imports porque Poliza_SAP.py los hace
+        # DENTRO de la función (a propósito: así el módulo se puede importar en
+        # una máquina sin Excel y sólo truena si de verdad se usa el botón).
+        "--hidden-import=win32com",
+        "--hidden-import=win32com.client",
+        "--hidden-import=pythoncom",
+        "--hidden-import=pywintypes",
 
         # Punto de entrada
         "main.py",
@@ -82,9 +105,10 @@ def create_executable():
             print("2. El usuario descomprime y ejecuta el .exe de adentro")
             print("   (el .exe NO funciona si se saca solo de la carpeta)")
             print("3. No requiere tener Python instalado")
-            print("4. Botón 'Examinar...' → elegir el archivo de Creación de Reservas")
-            print("5. El resultado se guarda en una subcarpeta 'Output'")
-            print("   junto al archivo elegido. El original NO se modifica.")
+            print("4. SÍ requiere tener Excel instalado para el botón de 'PÓLIZA SAP'")
+            print("5. Botón 'Examinar...' de cada bloque → elegir su archivo")
+            print("6. Los resultados se guardan en una subcarpeta 'Output'")
+            print("   junto a cada archivo elegido. Los originales NO se modifican.")
         else:
             print("❌ Error: No se encontró el ejecutable después de la compilación")
 
@@ -95,6 +119,7 @@ def create_executable():
         print("   - Ejecuta: pip install pyinstaller")
         print("   - Si el error menciona 'openpyxl', ejecuta: pip install openpyxl")
         print("   - Si el error menciona 'pandas', ejecuta: pip install pandas")
+        print("   - Si el error menciona 'win32com', ejecuta: pip install pywin32")
 
 
 def check_source_files():
@@ -121,6 +146,8 @@ def main():
 
     print()
     install_pyinstaller()
+    print()
+    check_pywin32()
     print()
     create_executable()
     print("\n🎉 ¡Proceso completado!")
