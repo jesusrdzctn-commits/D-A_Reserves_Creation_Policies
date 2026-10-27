@@ -4,8 +4,10 @@ RDA Pólizas D&A — interfaz_GUI.py
 
 tkinter GUI for the two consolidations of the project:
 
-    Archivo 1  '...Creacion de Reservas PMF OT.xlsx'   -> pestaña 'Variaciones'
-    Archivo 2  'Layout Creación Reservas DA WHSL.xlsb' -> sección 'PÓLIZA SAP'
+    Archivo 1  '...Creacion de Reservas PMF.xlsx'   -> pestaña 'Variaciones'
+    Archivo 2  'Layout Creación Reservas.xlsb' -> sección 'PÓLIZA SAP'
+               + plantilla 'Póliza Carga Batch' (.xlsx), que se llena al final
+               con los valores de esa sección (el archivo que sube a SAP)
 
 Each file owns its picker and its own button, because they are separate inputs
 with separate failures: if the .xlsb is open in Excel, the 'Variaciones' run
@@ -32,6 +34,9 @@ FILTRO_VARIACIONES = [("Libros de Excel", "*.xlsx *.xlsm"),
                       ("Todos los archivos", "*.*")]
 FILTRO_POLIZA      = [("Libros de Excel", "*.xlsb *.xlsx *.xlsm"),
                       ("Todos los archivos", "*.*")]
+# The 'Póliza Carga Batch' template is a plain .xlsx (the file SAP receives).
+FILTRO_BATCH       = [("Libros de Excel", "*.xlsx *.xlsm"),
+                      ("Todos los archivos", "*.*")]
 
 
 def _ruta_config():
@@ -53,7 +58,7 @@ class ReservasGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("RDA Pólizas D&A")
-        self.root.geometry("680x600")
+        self.root.geometry("680x660")
         self.root.resizable(False, False)
 
         # Colour scheme (same as Validación Factura Global)
@@ -86,6 +91,10 @@ class ReservasGUI:
         self.archivo_poliza_var = tk.StringVar(
             value=(cfg.get("ultimo_archivo_poliza") or "").strip()
         )
+        # Empty 'Póliza Carga Batch' template that process 2 fills at the end.
+        self.archivo_batch_var = tk.StringVar(
+            value=(cfg.get("ultimo_archivo_batch") or "").strip()
+        )
         # Empty = the month the code is being run (the spec's default). Typing
         # a key such as M07-26 re-runs a past month, which is also how the demo
         # is driven when the test file holds older months.
@@ -112,6 +121,7 @@ class ReservasGUI:
                     {
                         "ultimo_archivo_variaciones": self.archivo_var.get().strip(),
                         "ultimo_archivo_poliza": self.archivo_poliza_var.get().strip(),
+                        "ultimo_archivo_batch": self.archivo_batch_var.get().strip(),
                     },
                     f, ensure_ascii=False, indent=2,
                 )
@@ -142,7 +152,7 @@ class ReservasGUI:
         # PROCESO 1 — 'Variaciones'
         # ==============================================================
         frame1 = tk.LabelFrame(
-            main, text="  1. Creación de Reservas PMF OT  →  pestaña 'Variaciones'  ",
+            main, text="  1. Creación de Reservas PMF → pestaña 'Variaciones'  ",
             font=("Segoe UI", 10, "bold"),
             bg=self.bg_color, fg=self.primary_color,
             bd=1, relief=tk.SOLID, padx=14, pady=10,
@@ -191,23 +201,21 @@ class ReservasGUI:
         # PROCESO 2 — 'PÓLIZA SAP'
         # ==============================================================
         frame2 = tk.LabelFrame(
-            main, text="  2. Layout Creación Reservas DA WHSL  →  sección 'PÓLIZA SAP'  ",
+            main, text="  2. Layout Creación Reservas  →  'PÓLIZA SAP'  →  Póliza Carga Batch  ",
             font=("Segoe UI", 10, "bold"),
             bg=self.bg_color, fg=self.primary_color,
             bd=1, relief=tk.SOLID, padx=14, pady=10,
         )
         frame2.pack(fill="x", pady=(0, 10))
 
+        self._etiqueta_archivo(frame2, "Layout Creación Reservas (.xlsb):", pady=(0, 2))
         self._fila_archivo(frame2, self.archivo_poliza_var, self._elegir_archivo_poliza)
 
-        tk.Label(
-            frame2,
-            font=("Segoe UI", 8), bg=self.bg_color, fg=self.secondary_color,
-            anchor="w", justify="left",
-        ).pack(fill="x", pady=(8, 0))
+        self._etiqueta_archivo(frame2, "Plantilla 'Póliza Carga Batch' (vacía, .xlsx):", pady=(8, 2))
+        self._fila_archivo(frame2, self.archivo_batch_var, self._elegir_plantilla_batch)
 
         self.poliza_btn = tk.Button(
-            frame2, text="📋 Generar 'PÓLIZA SAP'",
+            frame2, text="📋 Generar 'PÓLIZA SAP' + Póliza Carga Batch",
             font=("Segoe UI", 10, "bold"),
             bg=self.accent_color, fg=self.bg_color,
             relief=tk.RAISED, bd=2, pady=8, cursor="hand2",
@@ -236,6 +244,13 @@ class ReservasGUI:
             bg=self.bg_color, fg="#666666", wraplength=610,
             anchor="w", justify="left",
         ).pack(fill="x", pady=(12, 0))
+
+    def _etiqueta_archivo(self, parent, texto, pady=(0, 2)):
+        """Small caption above a file row, so each picker says what it expects."""
+        tk.Label(
+            parent, text=texto, font=("Segoe UI", 8, "bold"),
+            bg=self.bg_color, fg=self.secondary_color, anchor="w",
+        ).pack(fill="x", pady=pady)
 
     def _fila_archivo(self, parent, variable, comando):
         """The 'entry + Examinar...' row, identical for both files."""
@@ -272,15 +287,22 @@ class ReservasGUI:
     def _elegir_archivo(self):
         self._elegir(
             self.archivo_var,
-            "Selecciona el archivo de Creación de Reservas PMF OT",
+            "Selecciona el archivo de Creación de Reservas",
             FILTRO_VARIACIONES,
         )
 
     def _elegir_archivo_poliza(self):
         self._elegir(
             self.archivo_poliza_var,
-            "Selecciona el Layout Creación Reservas DA WHSL",
+            "Selecciona el Layout Creación Reservas",
             FILTRO_POLIZA,
+        )
+
+    def _elegir_plantilla_batch(self):
+        self._elegir(
+            self.archivo_batch_var,
+            "Selecciona la plantilla de Póliza Carga Batch",
+            FILTRO_BATCH,
         )
 
     def _actualizar_preview_mes(self):
@@ -353,7 +375,7 @@ class ReservasGUI:
 
     def validate_variaciones(self):
         if not self._validar_ruta(
-            self.get_archivo(), "Creación de Reservas PMF OT", {".xlsx", ".xlsm"}
+            self.get_archivo(), "Creación de Reservas PMF", {".xlsx", ".xlsm"}
         ):
             return False
         try:
@@ -366,9 +388,24 @@ class ReservasGUI:
 
     def validate_poliza(self):
         if not self._validar_ruta(
-            self.get_archivo_poliza(), "Layout Creación Reservas DA WHSL",
+            self.get_archivo_poliza(), "Layout Creación Reservas",
             {".xlsb", ".xlsx", ".xlsm"}
         ):
+            return False
+        # Process 2 now ends by filling the batch template, so it is mandatory.
+        if not self._validar_ruta(
+            self.get_archivo_batch(), "la plantilla de Póliza Carga Batch",
+            {".xlsx", ".xlsm"}
+        ):
+            return False
+        # Same file in both pickers would make the run overwrite its own input.
+        if os.path.normcase(os.path.abspath(self.get_archivo_poliza())) == \
+                os.path.normcase(os.path.abspath(self.get_archivo_batch())):
+            messagebox.showerror(
+                "Mismo archivo",
+                "El Layout y la plantilla de Póliza Carga Batch son el mismo "
+                "archivo.\n\nElige cada uno con su botón 'Examinar...'.",
+            )
             return False
         self._guardar_config()
         return True
@@ -388,6 +425,9 @@ class ReservasGUI:
 
     def get_archivo_poliza(self):
         return self.archivo_poliza_var.get().strip()
+
+    def get_archivo_batch(self):
+        return self.archivo_batch_var.get().strip()
 
     def get_mes(self):
         """Month key typed by the user, or None to use today's month."""

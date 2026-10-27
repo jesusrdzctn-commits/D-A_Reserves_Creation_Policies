@@ -2,13 +2,13 @@
 RDA Pólizas D&A — Poliza_SAP.py
 ================================
 
-Fills the 'PÓLIZA SAP' section of 'Layout Creación Reservas DA WHSL_<mes>.xlsb'.
+Fills the 'PÓLIZA SAP' section of 'Layout Creación Reservas_<mes>.xlsb'.
 
 This is the SECOND consolidation of the project. It is deliberately a separate
 module from Consolidacion.py because it is a different animal:
 
     Consolidacion.py  ->  '...Creacion de Reservas PMF OT.xlsx'   openpyxl + pandas
-    Poliza_SAP.py     ->  'Layout Creación Reservas DA WHSL.xlsb'  Excel COM (win32com)
+    Poliza_SAP.py     ->  'Layout Creación Reservas.xlsb'  Excel COM (win32com)
 
 Why Excel COM and not openpyxl: the file is .xlsb (Excel Binary Workbook).
 openpyxl cannot even OPEN a .xlsb — it is a completely different container
@@ -365,7 +365,7 @@ def generar_poliza_sap(
     Fill the 'PÓLIZA SAP' section of the WHSL layout workbook.
 
     Args:
-        ruta_libro (str): path to 'Layout Creación Reservas DA WHSL_<mes>.xlsb'.
+        ruta_libro (str): path to 'Layout Creación Reservas_<mes>.xlsb'.
         ruta_salida (str|None): folder for the output copy. None -> the 'Output'
             folder resolved by carpeta_output_desde_input().
         sobrescribir_original (bool): True writes into the source file. Default

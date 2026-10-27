@@ -29,7 +29,6 @@ from datetime import datetime
 # Month key as written in the 'Mes' column of the 'Base' sheet: 'M06-26'.
 FORMATO_CLAVE_MES = "M%m-%y"
 
-# Spanish month names, for status messages and popups the stakeholder reads.
 MESES_ES = {
     1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
     7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre",
@@ -116,16 +115,8 @@ def etiqueta_mes_es(clave):
 def carpeta_output_desde_input(ruta_input):
     """
     Return the 'Output' folder that sits next to the input folder.
-
-    Same convention as Validación Factura Global: if the chosen folder is named
-    'Input' the Output lands BESIDE it (src/Output); for any other folder the
-    Output is created INSIDE it, so nothing is scattered outside the user's
-    choice.
-
-    Lives here rather than in a consolidation module because BOTH processes
-    ('Variaciones' and 'PÓLIZA SAP') need it, and importing one consolidation
-    module from the other would drag pandas and openpyxl into a process that
-    only talks to Excel COM.
+    If the chosen folder is named 'Input' the Output lands BESIDE it (src/Output); for any other folder the 
+    Output is created INSIDE it, so nothing is scattered outside the user's choice.
     """
     ruta = os.path.normpath(ruta_input)
     if os.path.basename(ruta).lower() == "input":
@@ -152,8 +143,7 @@ def abrir_excel():
     DispatchEx, not Dispatch, and this is the single most important line in the
     COM layer. Dispatch attaches to the Excel the user already has open; when we
     later call app.Quit() we would be closing THEIR workbooks with our own.
-    DispatchEx always starts a brand new, invisible instance that is ours to
-    kill. Different kitchen, same recipe.
+    DispatchEx always starts a brand new, invisible instance that is ours to kill.
     """
     try:
         import pythoncom
@@ -204,13 +194,9 @@ def cerrar_excel(app, wb, pythoncom):
 
 def hoja_por_nombre(wb, nombre):
     """
-    Find a sheet by name: EXACT match first, loose match (case/accent
-    insensitive) only as a fallback.
+    Find a sheet by name: EXACT match first, loose match (case/accent insensitive) only as a fallback.
 
-    The exact pass is not paranoia — the WHSL workbook really does carry both
-    'catalogo' and 'Catálogo', and they are different tables. A loose-first
-    match could grab the wrong one and every VLOOKUP would quietly return
-    garbage instead of failing.
+    The exact pass is not paranoia — the WHSL workbook really does carry both 'catalogo' and 'Catálogo', and they are different tables.
     """
     for ws in wb.Worksheets:
         if str(ws.Name) == nombre:

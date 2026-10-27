@@ -2,14 +2,14 @@
 RDA Pólizas D&A — controller.py
 ================================
 
-Wires the GUI to the two consolidation modules. Same shape as Validación
-Factura Global's controller: confirm, run, summarise in a popup, always
+Wires the GUI to the two consolidation modules: confirm, run, summarise in a popup, always
 re-enable the buttons in a `finally`.
 
 Three actions:
 
     execute_consolidacion()  archivo 1 -> pestaña 'Variaciones'   (openpyxl)
     execute_poliza_sap()     archivo 2 -> sección 'PÓLIZA SAP'    (Excel COM)
+                             and then -> 'Póliza Carga Batch'      (Excel COM)
     execute_todo()           both, in order, with a combined report
 
 The two processes never share state: different files, different engines,
@@ -25,11 +25,11 @@ from tkinter import messagebox
 
 from Comparativos import HOJA_COMPARATIVO_AGRUPADOR, HOJA_COMPARATIVO_BU
 from Consolidacion import HOJA_VARIACIONES, construir_variaciones
-from Poliza_SAP import HOJA_CREACIONES, generar_poliza_sap
+from Create_Poliza_Batch import generar_poliza_batch
+from Create_Poliza_SAP import HOJA_CREACIONES, generar_poliza_sap
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
 
-# How many unmatched concepts to list inside the popup before trimming, so the
-# message box never grows taller than the screen.
+# How many unmatched concepts to list inside the popup before trimming, so the message box never grows taller than the screen.
 MAX_NO_MAPEADOS_EN_POPUP = 8
 
 
@@ -52,16 +52,14 @@ class ReservasController:
         Returns (True, resumen) or (False, mensaje_de_error). It does NOT touch
         the buttons or show popups: the caller decides whether a failure means
         'stop everything' or 'note it and carry on with step 2'. That is the
-        whole reason this is factored out — 'Ejecutar todo' needs to survive a
+        whole reason this is factored out — 'Ejecutar todo' survives a
         failed step.
         """
         try:
             return True, funcion()
 
         except (FileNotFoundError, ValueError) as e:
-            # Expected, actionable problems: missing file, missing sheet,
-            # missing column, unparseable amount. The message already explains
-            # what to fix, so it is passed through as-is.
+            # Expected, actionable problems: missing file, missing sheet, missing column, unparseable amount. The message already explains what to fix, so it is passed through as-is.
             return False, str(e)
 
         except PermissionError:
@@ -76,6 +74,39 @@ class ReservasController:
 
         except Exception as e:
             return False, f"Ocurrió un error inesperado:\n\n{e}"
+
+    def _ejecutar_poliza(self, ruta_layout, ruta_plantilla):
+        """
+        Process 2 end to end: fill the layout's 'PÓLIZA SAP', then copy it into
+        the 'Póliza Carga Batch' template.
+
+        Returns (True, resumen) when the LAYOUT step worked, (False, mensaje)
+        when it did not. The batch step rides on top of it and reports through
+        two extra keys of the summary, so a batch failure never hides the fact
+        that the layout is already done and saved:
+
+            resumen['batch']        summary of the batch step, or None
+            resumen['batch_error']  message if the batch step failed, or None
+
+        The batch step does not run if the layout step failed: its input would
+        not exist.
+        """
+        ok, resumen = self._ejecutar(lambda: generar_poliza_sap(
+            ruta_layout, callback_status=self.gui.set_status,
+        ))
+        if not ok:
+            return False, resumen
+
+        self.gui.set_status("📦 Llenando la 'Póliza Carga Batch'...")
+        # resumen['ruta'] is the processed copy inside 'Output': that is the file
+        # the batch step reads (not the original), and 'Output' is where the
+        # batch lands too.
+        ok_batch, payload_batch = self._ejecutar(lambda: generar_poliza_batch(
+            resumen["ruta"], ruta_plantilla, callback_status=self.gui.set_status,
+        ))
+        resumen["batch"]       = payload_batch if ok_batch else None
+        resumen["batch_error"] = None if ok_batch else payload_batch
+        return True, resumen
 
     def _finalizar(self):
         """Re-enable the buttons and reset the status line if nothing succeeded."""
@@ -133,29 +164,38 @@ class ReservasController:
         if not self.gui.validate_poliza():
             return
 
-        ruta_libro = self.gui.get_archivo_poliza()
+        ruta_libro     = self.gui.get_archivo_poliza()
+        ruta_plantilla = self.gui.get_archivo_batch()
 
         confirm = messagebox.askyesno(
             "Confirmar póliza SAP",
-            f"¿Llenar la sección 'PÓLIZA SAP'?\n\n"
-            f"  📄 Archivo : {os.path.basename(ruta_libro)}\n"
+            f"¿Llenar la sección 'PÓLIZA SAP' y la Póliza Carga Batch?\n\n"
+            f"  📄 Layout  : {os.path.basename(ruta_libro)}\n"
             f"  📑 Pestaña : {HOJA_CREACIONES}\n"
-            f"  ✍️  Columnas: R, T, U, V, W, X, Z\n\n"
-            f"Se abrirá Excel en segundo plano y se trabajará sobre una\n"
-            f"COPIA en la subcarpeta 'Output'. El original no se toca."
+            f"  ✍️  Columnas: R, T, U, V, W, X, Z\n"
+            f"  📦 Plantilla: {os.path.basename(ruta_plantilla)}\n"
+            f"     (se llena con los valores de la póliza)\n\n"
+            f"Se abrirá Excel en segundo plano y se trabajará sobre COPIAS\n"
+            f"en la subcarpeta 'Output'. Los originales no se tocan."
         )
         if not confirm:
             return
 
         self.gui.disable_buttons()
         try:
-            ok, payload = self._ejecutar(lambda: generar_poliza_sap(
-                ruta_libro, callback_status=self.gui.set_status,
-            ))
-            if ok:
+            ok, payload = self._ejecutar_poliza(ruta_libro, ruta_plantilla)
+            if ok and not payload["batch_error"]:
                 self.gui.set_status("✅ ¡Póliza SAP completada!")
                 messagebox.showinfo(
                     "Póliza SAP completada", self._texto_poliza(payload)
+                )
+            elif ok:
+                # Layout done and saved; only the batch step failed.
+                self.gui.set_status(
+                    "⚠️ Póliza SAP completada, pero la Póliza Carga Batch falló"
+                )
+                messagebox.showwarning(
+                    "Póliza SAP completada a medias", self._texto_poliza(payload)
                 )
             else:
                 self.gui.set_status("❌ Error generando la póliza SAP")
@@ -172,6 +212,7 @@ class ReservasController:
 
         ruta_var = self.gui.get_archivo()
         ruta_pol = self.gui.get_archivo_poliza()
+        ruta_bat = self.gui.get_archivo_batch()
         mes      = self.gui.get_mes()
         anterior, actual = claves_mes_actual_y_anterior(mes)
 
@@ -181,8 +222,9 @@ class ReservasController:
             f"  1️⃣  '{HOJA_VARIACIONES}'\n"
             f"      📄 {os.path.basename(ruta_var)}\n"
             f"      📅 {anterior} vs {actual}\n\n"
-            f"  2️⃣  'PÓLIZA SAP'\n"
-            f"      📄 {os.path.basename(ruta_pol)}\n\n"
+            f"  2️⃣  'PÓLIZA SAP' + Póliza Carga Batch\n"
+            f"      📄 {os.path.basename(ruta_pol)}\n"
+            f"      📦 {os.path.basename(ruta_bat)}\n\n"
             f"Ambos escriben sobre COPIAS en la subcarpeta 'Output'."
         )
         if not confirm:
@@ -190,15 +232,12 @@ class ReservasController:
 
         self.gui.disable_buttons()
         try:
-            # --- Paso 1 ---------------------------------------------------
+            # --- Step 1 ---------------------------------------------------
             self.gui.set_status("1️⃣  Consolidando 'Variaciones'...")
             ok1, payload1 = self._ejecutar(lambda: construir_variaciones(
                 ruta_var, mes=mes, callback_status=self.gui.set_status,
             ))
 
-            # A failed step 1 does not have to kill step 2: the two files are
-            # independent. But it is the user's call, not the code's — silently
-            # carrying on would hide half a month-end.
             if not ok1:
                 seguir = messagebox.askyesno(
                     "Falló el paso 1",
@@ -210,11 +249,11 @@ class ReservasController:
                     self.gui.set_status("❌ Ejecución detenida en el paso 1")
                     return
 
-            # --- Paso 2 ---------------------------------------------------
+            # --- Step 2 ---------------------------------------------------
             self.gui.set_status("2️⃣  Generando la 'PÓLIZA SAP'...")
-            ok2, payload2 = self._ejecutar(lambda: generar_poliza_sap(
-                ruta_pol, callback_status=self.gui.set_status,
-            ))
+            ok2, payload2 = self._ejecutar_poliza(ruta_pol, ruta_bat)
+            # Step 2 counts as fully OK only if the batch file was also produced.
+            batch_fallo = ok2 and bool(payload2["batch_error"])
 
             # --- Combined report ------------------------------------------
             partes = []
@@ -222,13 +261,14 @@ class ReservasController:
                 f"1️⃣  {HOJA_VARIACIONES}  —  {'✅ OK' if ok1 else '❌ FALLÓ'}\n"
                 + (self._texto_variaciones(payload1) if ok1 else payload1)
             )
+            estado2 = "❌ FALLÓ" if not ok2 else ("⚠️ A MEDIAS" if batch_fallo else "✅ OK")
             partes.append(
-                f"2️⃣  PÓLIZA SAP  —  {'✅ OK' if ok2 else '❌ FALLÓ'}\n"
+                f"2️⃣  PÓLIZA SAP + Póliza Carga Batch  —  {estado2}\n"
                 + (self._texto_poliza(payload2) if ok2 else payload2)
             )
             texto = ("\n" + "─" * 48 + "\n").join(partes)
 
-            if ok1 and ok2:
+            if ok1 and ok2 and not batch_fallo:
                 self.gui.set_status("✅ ¡Ejecución completa completada!")
                 messagebox.showinfo("Ejecución completa", texto)
             elif ok1 or ok2:
@@ -247,10 +287,6 @@ class ReservasController:
     def _texto_variaciones(resumen):
         """
         Build the 'Variaciones' popup text.
-
-        The unmatched-concepts warning is deliberately loud: those rows DID make
-        it into the sheet under their raw name, so the Grand Total is right, but
-        somebody has to decide whether they belong in the catalogue.
         """
         bloques = "\n".join(
             f"     • {titulo}: {n} concepto(s)"
@@ -350,8 +386,7 @@ class ReservasController:
 
         The #N/A warning is the important half. Those rows are going up to SAP:
         a failed VLOOKUP means an account, a cost centre or a description that
-        the 'catalogo' sheet does not know about, and it has to be fixed BEFORE
-        the upload, not discovered by SAP.
+        the 'catalogo' sheet does not know about, and it has to be fixed BEFORE the upload to SAP.
         """
         columnas = "\n".join(f"     • {c}" for c in resumen["columnas"])
 
@@ -388,4 +423,50 @@ class ReservasController:
         else:
             texto += "\n\n✅ Sin errores: todos los VLOOKUP empataron."
 
+        texto += ReservasController._texto_batch(resumen)
+
+        return texto
+
+    @staticmethod
+    def _texto_batch(resumen):
+        """
+        Build the 'Póliza Carga Batch' half of the 'PÓLIZA SAP' popup.
+
+        Two outcomes: the batch file was produced (with whatever warnings it
+        carries), or it was not — which is NOT an error dialog, because the
+        layout half is already saved, but must not be silent either.
+        """
+        error = resumen.get("batch_error")
+        if error:
+            return (
+                f"\n\n❌ La Póliza Carga Batch NO se generó:\n\n{error}\n\n"
+                f"La 'PÓLIZA SAP' del Layout sí quedó lista en el archivo de arriba."
+            )
+
+        batch = resumen.get("batch")
+        if not batch:
+            return ""
+
+        d_ini, d_fin = batch["bloque_debito"]
+        c_ini, c_fin = batch["bloque_credito"]
+        texto = (
+            f"\n\n📦 Póliza Carga Batch generada:\n{batch['ruta']}\n\n"
+            f"  • Pestaña          : {batch['hoja']}\n"
+            f"  • Bloque débito    : filas {d_ini}–{d_fin} ({batch['filas_origen']:,})\n"
+            f"  • Bloque crédito   : filas {c_ini}–{c_fin} ({batch['filas_origen']:,})\n"
+            f"  • Σ Debit Amount   : {batch['total_debito']:,.2f}\n"
+            f"  • Σ Credit Amount  : {batch['total_credito']:,.2f}\n"
+            f"  ✅ Verificado: lo pegado coincide con el Layout, celda por celda."
+        )
+
+        advertencias = batch.get("advertencias") or []
+        if advertencias:
+            texto += "\n\n⚠️ Revisa antes de subir a SAP:\n" + "\n".join(
+                f"     • {a}" for a in advertencias
+            )
+
+        texto += (
+            "\n\nℹ️ Todavía sin llenar en la plantilla: 'GL Account' del bloque de\n"
+            "crédito y los campos naranjas (Company Code, fechas, etc.)."
+        )
         return texto

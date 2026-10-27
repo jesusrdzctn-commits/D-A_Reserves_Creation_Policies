@@ -15,7 +15,8 @@ ARCHIVOS_REQUERIDOS = [
     "controller.py",
     "Consolidacion.py",
     "Comparativos.py",
-    "Poliza_SAP.py",
+    "Create_Poliza_SAP.py",
+    "Create_Poliza_Batch.py",
     "utils.py",
 ]
 
@@ -33,9 +34,10 @@ def install_pyinstaller():
 
 def check_pywin32():
     """
-    pywin32 es lo que le permite a Poliza_SAP.py manejar Excel (el archivo
-    WHSL es .xlsb y sólo Excel lo abre de forma nativa). Sin esto, el botón
-    de 'PÓLIZA SAP' truena en tiempo de ejecución, no al compilar.
+    pywin32 es lo que le permite a Create_Poliza_SAP.py y Create_Poliza_Batch.py
+    manejar Excel (el archivo WHSL es .xlsb y sólo Excel lo abre de forma
+    nativa). Sin esto, el botón de 'PÓLIZA SAP' truena en tiempo de ejecución,
+    no al compilar.
     """
     try:
         import win32com.client  # noqa: F401
