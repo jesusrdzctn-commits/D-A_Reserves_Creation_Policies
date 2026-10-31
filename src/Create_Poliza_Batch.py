@@ -1,56 +1,7 @@
-"""
-RDA Pólizas D&A — Create_Poliza_Batch.py
-========================================
-
-Third consolidation of the project: copies the finished 'PÓLIZA SAP' section of
-'Layout Creación Reservas' into the template 'Póliza Carga Batch Creaciones'
-(sheet 'GL Posting Upload'), which is the file the stakeholder uploads to SAP.
-
-    Layout Creación Reservas (.xlsb, sheet 'Creaciones')  --values-->  Póliza Carga Batch (.xlsx)
-
-It runs AFTER Create_Poliza_SAP.generar_poliza_sap(): that function fills and
-freezes columns R..Z of the layout; this one only READS them. The layout is
-opened read-only and is never saved.
-
-
-WHAT GOES WHERE  (yellow cells of the template)
------------------------------------------------
-    Layout 'Creaciones'            Template 'GL Posting Upload'     Block
-    ---------------------------    ----------------------------     -------------
-    R  CUENTA SAP                  GL Account                       debit only
-    T  CeBe                        Profit Center                    debit + credit
-    U  SEGMENTO                    Segment                          debit + credit
-    V  Asignación                  Assignment                       debit + credit
-    X  MONTO                       Debit Amount                     debit block
-    X  MONTO                       Credit Amount                    credit block
-    Z  CONCEPTO (descripción SAP)  Line item Text                   debit + credit
-
-The data is written TWICE, one block under the other, with no gap:
-
-    row 1                header
-    rows 2 .. n+1        debit block   (GL Account, Profit Center, Segment,
-                                        Assignment, Debit Amount, Line item Text)
-    rows n+2 .. 2n+1    credit block  (Profit Center, Segment, Assignment,
-                                        Credit Amount, Line item Text)
-                                        -> GL Account is intentionally left EMPTY
-                                           in the credit block.
-
-Everything is pasted with Copy + PasteSpecial(Values), i.e. Excel's own
-'Pegado especial -> Valores'. NOT `dest.Value = src.Value`: that would make Excel
-re-parse '0004209900' and drop the leading zeros (see Create_Poliza_SAP.py).
-
-The orange cells of the template (Document Sequence #, Company Code, dates...)
-are NOT filled here yet. They are left untouched until their rules are defined.
-
-
-SAFETY NET
-----------
-The run refuses to produce the file when the layout still has error cells
-(#N/A from a failed VLOOKUP), empty cells or a non-numeric amount: those rows
-would be rejected by SAP. After pasting, every pasted column is read back and
-compared with the layout; the file is only saved if they are identical, and it
-is written under a temporary name and renamed at the very end, so a failed run
-can never leave a half-built (or empty) batch file next to the good ones.
+"""RDA Pólizas D&A — copies the finished 'PÓLIZA SAP' of the OT layout (both tabs) into the template
+'Póliza Carga Batch' ('GL Posting Upload'): one debit block, then one credit block (no GL Account).
+Runs after generar_poliza_sap(); pastes values, reads them back and saves only if identical.
+The template's orange cells (document number, company code, dates...) are NOT filled yet.
 """
 
 import math
@@ -60,24 +11,21 @@ import shutil
 import time
 from datetime import datetime
 
-# The layout helpers live in Create_Poliza_SAP.py. They are reused instead of
-# copied so both modules always agree on where the section starts and ends.
+# Layout helpers are reused from Create_Poliza_SAP so both modules agree on where the section starts and ends.
 from Create_Poliza_SAP import (
-    COLUMNAS_POLIZA,
-    HOJA_CREACIONES,
+    CLAVE_MONTO,
     XL_PASTE_VALUES,
-    _localizar_fila_encabezado,
-    _ultima_fila,
-    _validar_encabezados,
+    localizar_secciones,
+    titulo_de,
 )
 from utils import abrir_excel as _abrir_excel
 from utils import cerrar_excel as _cerrar_excel
+from utils import error_de_excel as _error_de
+from utils import es_vacio_excel as _vacio
 from utils import hoja_por_nombre as _hoja
 from utils import norm_texto as _norm
 
-# ----------------------------------------------------------------------
-# Template layout
-# ----------------------------------------------------------------------
+# --- Template layout ---
 HOJA_PLANTILLA = "GL Posting Upload"
 EXTENSIONES_PLANTILLA = (".xlsx", ".xlsm")
 
@@ -90,30 +38,28 @@ DEST_CUENTA, DEST_DEBITO, DEST_CREDITO = "GL Account", "Debit Amount", "Credit A
 DEST_CEBE, DEST_SEGMENTO = "Profit Center", "Segment"
 DEST_ASIGNACION, DEST_TEXTO = "Assignment", "Line item Text"
 
-# Title (in COLUMNAS_POLIZA) of the layout column that feeds each header.
-# The letters (R, T, U...) are NOT repeated here: they are looked up in
-# COLUMNAS_POLIZA, so if the layout columns ever move there is one place to fix.
-TITULO_MONTO = "MONTO"
-TITULO_CUENTA = "CUENTA SAP"
+# Key (in Create_Poliza_SAP.COLUMNAS_POLIZA) of the layout column feeding each header; letters are never repeated here.
+CLAVE_CUENTA = "cuenta"
+# The column the amount is compared against, to warn when they differ.
+CLAVE_COMPARACION = "mxn" if CLAVE_MONTO != "mxn" else "redondeo"
 TRANSFERENCIAS = (
-    {"origen": TITULO_CUENTA,                "destino": DEST_CUENTA,
+    {"origen": CLAVE_CUENTA,   "destino": DEST_CUENTA,
      "en_debito": True,  "en_credito": False},
-    {"origen": "CeBe",                       "destino": DEST_CEBE,
+    {"origen": "cebe",         "destino": DEST_CEBE,
      "en_debito": True,  "en_credito": True},
-    {"origen": "SEGMENTO",                   "destino": DEST_SEGMENTO,
+    {"origen": "segmento",     "destino": DEST_SEGMENTO,
      "en_debito": True,  "en_credito": True},
-    {"origen": "Asignación",                 "destino": DEST_ASIGNACION,
+    {"origen": "asignacion",   "destino": DEST_ASIGNACION,
      "en_debito": True,  "en_credito": True},
-    {"origen": TITULO_MONTO,                 "destino": DEST_DEBITO,
+    {"origen": CLAVE_MONTO,    "destino": DEST_DEBITO,
      "en_debito": True,  "en_credito": False},
-    {"origen": TITULO_MONTO,                 "destino": DEST_CREDITO,
+    {"origen": CLAVE_MONTO,    "destino": DEST_CREDITO,
      "en_debito": False, "en_credito": True},
-    {"origen": "CONCEPTO (descripción SAP)", "destino": DEST_TEXTO,
+    {"origen": "concepto",     "destino": DEST_TEXTO,
      "en_debito": True,  "en_credito": True},
 )
 
-# Standard SAP field lengths. Used ONLY to warn (SAP truncates or rejects
-# longer values on upload); the run is never blocked by them.
+# Standard SAP field lengths; only used to WARN (SAP truncates or rejects longer values).
 LONGITUD_MAX_SAP = {
     DEST_CUENTA: 10,
     DEST_CEBE: 10,
@@ -122,113 +68,51 @@ LONGITUD_MAX_SAP = {
     DEST_TEXTO: 50,
 }
 
-# ----------------------------------------------------------------------
-# Behaviour flags
-# ----------------------------------------------------------------------
-# Clear the target columns of the template (below the header) before pasting,
-# so leftovers of an old run in the template cannot survive under the new data.
+# --- Behaviour flags ---
+# Clear the template's target columns (below the header) first so an old run's leftovers cannot survive.
 LIMPIAR_ANTES = True
 
 # How many offending cells / rows to list per problem.
 MAX_DETALLE = 10
 
-# Excel's clipboard and the file system both fail transiently now and then
-# (another app grabbing the clipboard, antivirus scanning the new file).
+# Excel's clipboard and the file system fail transiently (another app on the clipboard, antivirus).
 INTENTOS = 4
 ESPERA_SEG = 0.6
-
-# Excel error values as pywin32 returns them (CVErr codes as signed ints).
-CODIGOS_ERROR_EXCEL = {
-    -2146826288: "#NULL!",
-    -2146826281: "#DIV/0!",
-    -2146826273: "#VALUE!",
-    -2146826265: "#REF!",
-    -2146826259: "#NAME?",
-    -2146826252: "#NUM!",
-    -2146826246: "#N/A",
-    -2146826245: "#GETTING_DATA",
-}
 
 # Tolerance when comparing the debit / credit / layout totals (cents).
 TOLERANCIA_TOTAL = 0.005
 
 
-# ======================================================================
-# Small helpers
-# ======================================================================
+# --- Small helpers ---
 def _misma_ruta(a, b):
     """True when two paths point to the same file (Windows: case-insensitive)."""
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def _nombre_salida(ruta_plantilla):
-    """
-    Name of the generated file, derived from the template's name.
-
-        '07 Póliza Carga Batch Creaciones_OT 26 template_IA_v2.xlsx'
-            -> '07 Póliza Carga Batch Creaciones_OT 26_20261027.xlsx'
-
-    Everything from the word 'template' on is dropped, and the date stamp is
-    ALWAYS appended, so the output can never be named like the template itself.
-    """
+    """Output name from the template's: everything from 'template' on is dropped and a date stamp ALWAYS appended
+    ('...OT 26 template_IA_v2.xlsx' -> '...OT 26_20261027.xlsx'), so it can never equal the template's name."""
     base, ext = os.path.splitext(os.path.basename(ruta_plantilla))
     limpio = re.sub(r"[\s_\-]*template.*$", "", base, flags=re.IGNORECASE).strip(" _-")
     sello = datetime.today().strftime("%Y%m%d")
     return f"{limpio or base}_{sello}{ext}"
 
 
-def _letra_origen(titulo):
-    """Layout column letter of a COLUMNAS_POLIZA entry, looked up by its title."""
-    for spec in COLUMNAS_POLIZA:
-        if spec["titulo"] == titulo:
-            return spec["col"]
-    raise ValueError(
-        f"La columna '{titulo}' ya no existe en COLUMNAS_POLIZA "
-        f"(Create_Poliza_SAP.py). ¿Se renombró o se quitó?"
-    )
-
-
-def _titulos_origen():
+def _claves_origen():
     """Layout columns that feed the batch, in order, without repeats."""
-    vistos = []
+    vistas = []
     for t in TRANSFERENCIAS:
-        if t["origen"] not in vistos:
-            vistos.append(t["origen"])
-    return vistos
+        if t["origen"] not in vistas:
+            vistas.append(t["origen"])
+    return vistas
 
 
 def _leer_rango(rango, n):
-    """
-    Value2 of a ONE-column range as a flat list of n items.
-
-    A single-cell range returns a scalar (not a tuple of tuples), which is the
-    classic COM trap for a policy with one line.
-    Value2, not Value: it hands back raw numbers and text, never dates/currency.
-    """
+    """Value2 of a ONE-column range as a flat list (a single cell returns a scalar: the COM trap for one-line policies)."""
     valor = rango.Value2
     if n == 1:
         return [valor]
     return [fila[0] for fila in valor]
-
-
-def _vacio(valor):
-    return valor is None or (isinstance(valor, str) and not valor.strip())
-
-
-def _error_de(valor):
-    """
-    Excel error text ('#N/A', '#REF!'...) of a cell value, or None if it is not an error.
-
-    pywin32 hands errors over as CVErr ints; the literal text is accepted too so
-    a different pywin32/Excel build cannot sneak an error past the check.
-    """
-    if isinstance(valor, bool):          # bool is an int subclass: exclude it first
-        return None
-    if isinstance(valor, int):
-        return CODIGOS_ERROR_EXCEL.get(valor)
-    if isinstance(valor, str) and valor.strip() in CODIGOS_ERROR_EXCEL.values():
-        return valor.strip()
-    return None
 
 
 def _abrir_libro(app, ruta, solo_lectura):
@@ -247,12 +131,8 @@ def _abrir_libro(app, ruta, solo_lectura):
 
 
 def _pegar_valores(app, origen, destino):
-    """
-    Copy -> Paste Special -> Values, retrying when the clipboard is busy.
-
-    The marching ants are always cleared, so the user's clipboard is not left
-    holding a chunk of the workbook.
-    """
+    """Copy -> Paste Special -> Values, retrying while the clipboard is busy.
+    Always clears the marching ants so the user's clipboard is not left holding part of the workbook."""
     ultimo = None
     for intento in range(INTENTOS):
         try:
@@ -273,65 +153,47 @@ def _pegar_valores(app, origen, destino):
     )
 
 
-# ======================================================================
-# Layout (source)
-# ======================================================================
-def _localizar_origen(ws):
-    """
-    Header row, first and last data row of the layout's 'PÓLIZA SAP' section.
+# --- Layout (source) ---
+def _leer_origen(secciones):
+    """{key: {'valores', 'celdas', 'titulo'}} for every copied layout column (plus the amount's comparison column).
+    Rows of all tabs follow one another in tab order, as pasted; 'celdas' holds each address ('Reservas Rentas!K8')."""
+    claves = _claves_origen()
+    if CLAVE_COMPARACION not in claves:
+        claves.append(CLAVE_COMPARACION)
 
-    Same detection as the module that fills it, on purpose.
-    """
-    if bool(ws.FilterMode):
-        # Copy on a filtered range only takes the VISIBLE rows: the batch would
-        # silently come out short. Better to stop and ask for the filter off.
-        raise ValueError(
-            f"La pestaña '{HOJA_CREACIONES}' del Layout tiene un filtro activo "
-            f"(hay filas ocultas por el filtro).\n\n"
-            f"Quita el filtro y vuelve a intentar."
-        )
-
-    fila_encabezado = _localizar_fila_encabezado(ws)
-    _validar_encabezados(ws, fila_encabezado)
-    fila_inicio = fila_encabezado + 1
-    fila_fin = _ultima_fila(ws, fila_inicio)
-    if fila_fin is None:
-        raise ValueError(
-            f"No encontré datos en la pestaña '{HOJA_CREACIONES}' del Layout "
-            f"(a partir de la fila {fila_inicio}).\n\n¿Es el archivo correcto?"
-        )
-    return fila_inicio, fila_fin
-
-
-def _leer_origen(ws, fila_inicio, fila_fin):
-    """{title: (column letter, [values])} for every layout column that is copied."""
-    n = fila_fin - fila_inicio + 1
     datos = {}
-    for titulo in _titulos_origen():
-        letra = _letra_origen(titulo)
-        rango = ws.Range(f"{letra}{fila_inicio}:{letra}{fila_fin}")
-        datos[titulo] = (letra, _leer_rango(rango, n))
+    for clave in claves:
+        valores, celdas = [], []
+        for s in secciones:
+            col = s["columnas"][clave]
+            rango = s["hoja"].Range(
+                f"{col['letra']}{s['fila_inicio']}:{col['letra']}{s['fila_fin']}"
+            )
+            valores += _leer_rango(rango, s["filas"])
+            celdas += [f"{s['nombre']}!{col['letra']}{s['fila_inicio'] + i}"
+                       for i in range(s["filas"])]
+        datos[clave] = {"valores": valores, "celdas": celdas, "titulo": titulo_de(clave)}
     return datos
 
 
-def _validar_origen(datos, fila_inicio):
-    """
-    Check what is about to go up to SAP.
+def _enumerar(celdas):
+    """First MAX_DETALLE cells, plus an ellipsis when there are more."""
+    return ", ".join(celdas[:MAX_DETALLE]) + ("..." if len(celdas) > MAX_DETALLE else "")
 
-    Returns (problemas, advertencias):
-      problemas    -> BLOCK the run: error cells, empty cells, non-numeric amount.
-      advertencias -> reported in the summary, do not block: zero / negative
-                      amounts, numeric GL accounts, values longer than SAP allows.
-    """
+
+def _validar_origen(datos):
+    """Check what is about to go up to SAP: returns (problemas, advertencias).
+    problemas BLOCK the run (error cells, empty cells, non-numeric amount); advertencias only report
+    (zero/negative amounts, numeric GL accounts, values over SAP lengths, REDONDEO != MXN)."""
     problemas = []
     advertencias = []
 
-    for titulo, (letra, valores) in datos.items():
-        es_monto = titulo == TITULO_MONTO
+    for clave in _claves_origen():
+        d = datos[clave]
+        es_monto = clave == CLAVE_MONTO
         grupos = {"error": [], "vacío": [], "no numérico": [], "tipo inesperado": []}
 
-        for i, valor in enumerate(valores):
-            celda = f"{letra}{fila_inicio + i}"
+        for celda, valor in zip(d["celdas"], d["valores"]):
             if _error_de(valor):
                 grupos["error"].append(f"{celda} {_error_de(valor)}")
             elif _vacio(valor):
@@ -346,49 +208,57 @@ def _validar_origen(datos, fila_inicio):
         for tipo, celdas in grupos.items():
             if celdas:
                 problemas.append({
-                    "columna": letra, "titulo": titulo, "tipo": tipo,
+                    "titulo": d["titulo"], "tipo": tipo,
                     "total": len(celdas), "celdas": celdas[:MAX_DETALLE],
                 })
 
     # --- Warnings (only meaningful when the cells themselves are usable) ---
     if not problemas:
-        letra_m, montos = datos[TITULO_MONTO]
-        ceros = [f"{letra_m}{fila_inicio + i}" for i, v in enumerate(montos) if v == 0]
-        negativos = [f"{letra_m}{fila_inicio + i}" for i, v in enumerate(montos) if v < 0]
+        monto = datos[CLAVE_MONTO]
+        ceros = [c for c, v in zip(monto["celdas"], monto["valores"]) if v == 0]
+        negativos = [c for c, v in zip(monto["celdas"], monto["valores"]) if v < 0]
         if ceros:
             advertencias.append(
-                f"{len(ceros)} renglón(es) con MONTO = 0 (se pasan tal cual): "
-                + ", ".join(ceros[:MAX_DETALLE]) + ("..." if len(ceros) > MAX_DETALLE else "")
+                f"{len(ceros)} renglón(es) con {monto['titulo']} = 0 (se pasan tal cual): "
+                + _enumerar(ceros)
             )
         if negativos:
             advertencias.append(
-                f"{len(negativos)} renglón(es) con MONTO negativo (irían con signo "
-                f"negativo en Debit y Credit Amount): "
-                + ", ".join(negativos[:MAX_DETALLE]) + ("..." if len(negativos) > MAX_DETALLE else "")
+                f"{len(negativos)} renglón(es) con {monto['titulo']} negativo (irían con "
+                f"signo negativo en Debit y Credit Amount): " + _enumerar(negativos)
             )
 
-        letra_c, cuentas = datos[TITULO_CUENTA]
-        numericas = [f"{letra_c}{fila_inicio + i}" for i, v in enumerate(cuentas)
+        comparado = datos[CLAVE_COMPARACION]
+        difieren = [
+            c for c, a, b in zip(monto["celdas"], monto["valores"], comparado["valores"])
+            if isinstance(b, (int, float)) and abs(a - b) > TOLERANCIA_TOTAL
+        ]
+        if difieren:
+            advertencias.append(
+                f"{len(difieren)} renglón(es) donde '{monto['titulo']}' (el que se manda a "
+                f"SAP) y '{comparado['titulo']}' no coinciden: " + _enumerar(difieren)
+            )
+
+        cuentas = datos[CLAVE_CUENTA]
+        numericas = [c for c, v in zip(cuentas["celdas"], cuentas["valores"])
                      if not isinstance(v, str)]
         if numericas:
             advertencias.append(
-                f"{len(numericas)} CUENTA SAP vienen como NÚMERO y no como texto "
-                f"(¿se perdieron ceros a la izquierda?): "
-                + ", ".join(numericas[:MAX_DETALLE]) + ("..." if len(numericas) > MAX_DETALLE else "")
+                f"{len(numericas)} {cuentas['titulo']} vienen como NÚMERO y no como texto "
+                f"(¿se perdieron ceros a la izquierda?): " + _enumerar(numericas)
             )
 
         for t in TRANSFERENCIAS:
             limite = LONGITUD_MAX_SAP.get(t["destino"])
             if not limite:
                 continue
-            letra_o, valores = datos[t["origen"]]
-            largos = [f"{letra_o}{fila_inicio + i}" for i, v in enumerate(valores)
+            d = datos[t["origen"]]
+            largos = [c for c, v in zip(d["celdas"], d["valores"])
                       if isinstance(v, str) and len(v) > limite]
             if largos:
                 advertencias.append(
                     f"{len(largos)} valor(es) de '{t['destino']}' exceden los {limite} "
-                    f"caracteres que SAP acepta: "
-                    + ", ".join(largos[:MAX_DETALLE]) + ("..." if len(largos) > MAX_DETALLE else "")
+                    f"caracteres que SAP acepta: " + _enumerar(largos)
                 )
 
     return problemas, advertencias
@@ -401,8 +271,8 @@ def _texto_problemas(problemas, ruta_layout):
     for p in problemas:
         resto = p["total"] - len(p["celdas"])
         lineas.append(
-            f"     • {p['columna']} ({p['titulo']}): {p['total']} celda(s) con "
-            f"{p['tipo']}\n       " + ", ".join(p["celdas"])
+            f"     • {p['titulo']}: {p['total']} celda(s) con {p['tipo']}\n       "
+            + ", ".join(p["celdas"])
             + (f", ...y {resto} más" if resto > 0 else "")
         )
     return (
@@ -410,14 +280,12 @@ def _texto_problemas(problemas, ruta_layout):
         f"celda(s) con problemas que SAP rechazaría.\n\n"
         + "\n".join(lineas)
         + "\n\nCorrígelas (normalmente es un valor que falta en la pestaña "
-          "'catalogo') y vuelve a correr 'Generar PÓLIZA SAP'.\n\n"
+          "'Catalogo') y vuelve a correr 'Generar PÓLIZA SAP'.\n\n"
           f"Layout revisado:\n{ruta_layout}"
     )
 
 
-# ======================================================================
-# Template (destination)
-# ======================================================================
+# --- Template (destination) ---
 def _hoja_plantilla(wb):
     """The template's sheet by name; a one-sheet workbook is accepted whatever it is called."""
     try:
@@ -429,13 +297,8 @@ def _hoja_plantilla(wb):
 
 
 def _localizar_destino(ws):
-    """
-    Find the header row of the template and the column of every target header.
-
-    Returns (fila_encabezado, {header: column index}). Looking the columns up by
-    NAME (not by letter) means a template where somebody inserted a column still
-    lands every value under the right header — or stops with a readable message.
-    """
+    """(fila_encabezado, {header: column index}) of the template, found by NAME so an inserted column
+    still lands every value under the right header, or stops with a readable message."""
     requeridos = {_norm(h): h for h in (
         DEST_CUENTA, DEST_DEBITO, DEST_CREDITO, DEST_CEBE,
         DEST_SEGMENTO, DEST_ASIGNACION, DEST_TEXTO,
@@ -487,9 +350,7 @@ def _limpiar_destino(ws, fila_encabezado, columnas):
         _rango_destino(ws, col_idx, fila_encabezado + 1, fila_usada).ClearContents()
 
 
-# ======================================================================
-# Paste + verification
-# ======================================================================
+# --- Paste + verification ---
 def _bloques(fila_encabezado, n):
     """Row spans of the two blocks, the credit one starting right under the debit one."""
     d_ini = fila_encabezado + 1
@@ -499,8 +360,8 @@ def _bloques(fila_encabezado, n):
     return {"debito": (d_ini, d_fin), "credito": (c_ini, c_fin)}
 
 
-def _pegar_todo(app, ws_origen, ws_destino, columnas, bloques, fila_inicio, fila_fin):
-    """Paste every (column, block) of TRANSFERENCIAS as values."""
+def _pegar_todo(app, ws_destino, columnas, bloques, secciones):
+    """Paste every (column, block) of TRANSFERENCIAS as values; each tab lands at its 'desplazamiento' offset."""
     # PasteSpecial wants the destination sheet to be the active one.
     try:
         ws_destino.Parent.Activate()
@@ -509,33 +370,29 @@ def _pegar_todo(app, ws_origen, ws_destino, columnas, bloques, fila_inicio, fila
         pass
 
     for t in TRANSFERENCIAS:
-        letra = _letra_origen(t["origen"])
-        origen = ws_origen.Range(f"{letra}{fila_inicio}:{letra}{fila_fin}")
         for bloque, bandera in (("debito", "en_debito"), ("credito", "en_credito")):
             if not t[bandera]:
                 continue
-            r1, r2 = bloques[bloque]
-            _pegar_valores(app, origen, _rango_destino(ws_destino, columnas[t["destino"]], r1, r2))
+            r1, _ = bloques[bloque]
+            for s in secciones:
+                letra = s["columnas"][t["origen"]]["letra"]
+                origen = s["hoja"].Range(f"{letra}{s['fila_inicio']}:{letra}{s['fila_fin']}")
+                desde = r1 + s["desplazamiento"]
+                hasta = desde + s["filas"] - 1
+                _pegar_valores(
+                    app, origen, _rango_destino(ws_destino, columnas[t["destino"]], desde, hasta)
+                )
 
 
 def _verificar(ws_destino, columnas, bloques, datos, n):
-    """
-    Read the template back and compare it with the layout.
-
-    Returns (diferencias, sumas, total_origen):
-      diferencias  readable differences, empty list = identical
-      sumas        {'Debit Amount': x, 'Credit Amount': y} as read from the template
-      total_origen sum of MONTO in the layout
-
-    Three things are checked: every pasted column equals its source cell by cell
-    (this is what catches a lost leading zero), every cell that must stay empty
-    IS empty, and debit total = credit total = layout total.
-    """
+    """Read the template back: returns (diferencias, sumas, total_origen); empty diferencias = identical.
+    Checks every pasted column cell by cell (catches lost leading zeros), that cells which must stay empty ARE empty,
+    and that debit total = credit total = layout total (all tabs)."""
     diferencias = []
     sumas = {}
 
     for t in TRANSFERENCIAS:
-        _, esperado = datos[t["origen"]]
+        esperado = datos[t["origen"]]["valores"]
         col_idx = columnas[t["destino"]]
         for bloque, bandera in (("debito", "en_debito"), ("credito", "en_credito")):
             r1, r2 = bloques[bloque]
@@ -559,7 +416,9 @@ def _verificar(ws_destino, columnas, bloques, datos, n):
                         f"filas {sucios[:MAX_DETALLE]}"
                     )
 
-    total_origen = math.fsum(v for v in datos[TITULO_MONTO][1] if isinstance(v, (int, float)))
+    total_origen = math.fsum(
+        v for v in datos[CLAVE_MONTO]["valores"] if isinstance(v, (int, float))
+    )
     for destino, suma in sumas.items():
         if abs(suma - total_origen) > TOLERANCIA_TOTAL:
             diferencias.append(
@@ -568,39 +427,18 @@ def _verificar(ws_destino, columnas, bloques, datos, n):
     return diferencias, sumas, total_origen
 
 
-# ======================================================================
-# Main entry point
-# ======================================================================
+# --- Main entry point ---
 def generar_poliza_batch(
     ruta_layout,
     ruta_plantilla,
     ruta_salida=None,
     callback_status=None,
 ):
-    """
-    Fill 'Póliza Carga Batch Creaciones' from the finished layout.
-
-    Args:
-        ruta_layout (str): the layout ALREADY processed by generar_poliza_sap()
-            (its 'PÓLIZA SAP' columns filled). Opened read-only, never saved.
-        ruta_plantilla (str): the empty 'Póliza Carga Batch ... template' (.xlsx).
-            Never modified: the work happens on a copy.
-        ruta_salida (str|None): folder for the result. None -> the folder of
-            ruta_layout (which is already the 'Output' folder when it is the copy
-            produced by generar_poliza_sap()).
-        callback_status (function|None): progress reporting for the GUI.
-
-    Returns:
-        dict: ruta, origen, hoja, filas_origen, filas_totales, bloque_debito,
-              bloque_credito, total_debito, total_credito, columnas,
-              advertencias.
-
-    Raises:
-        FileNotFoundError / ValueError: expected, actionable problems (missing
-            file, filtered layout, error cells in the layout, wrong template).
-        RuntimeError: Excel / clipboard failures, or the read-back check failing.
-        PermissionError: the destination file is open in Excel.
-    """
+    """Fill 'Póliza Carga Batch Creaciones' from the layout ALREADY processed by generar_poliza_sap().
+    Layout (read-only) and template are never modified; ruta_salida=None -> the layout's folder ('Output').
+    Returns: ruta, origen, hojas_origen, hoja, filas_origen, filas_totales, bloque_debito, bloque_credito,
+    total_debito, total_credito, columnas, advertencias. Raises FileNotFoundError/ValueError (fixable),
+    RuntimeError (Excel/clipboard/read-back failures), PermissionError (destination open in Excel)."""
     def update_status(mensaje):
         if callback_status:
             callback_status(mensaje)
@@ -642,18 +480,22 @@ def generar_poliza_batch(
             wb_origen = _abrir_libro(app, os.path.abspath(ruta_layout), solo_lectura=True)
             wb_destino = _abrir_libro(app, ruta_tmp, solo_lectura=False)
 
-            ws_origen = _hoja(wb_origen, HOJA_CREACIONES)
             ws_destino = _hoja_plantilla(wb_destino)
 
             # --- Read and validate the layout ----------------------------
-            fila_inicio, fila_fin = _localizar_origen(ws_origen)
-            n = fila_fin - fila_inicio + 1
-            update_status(f"🔎 Revisando {n:,} renglones del Layout (filas {fila_inicio}–{fila_fin})...")
+            secciones, avisos_layout = localizar_secciones(wb_origen)
+            n = 0
+            for s in secciones:
+                s["desplazamiento"] = n      # where this tab starts inside each block
+                n += s["filas"]
+            desglose = " + ".join(f"{s['etiqueta']} {s['filas']}" for s in secciones)
+            update_status(f"🔎 Revisando {n:,} renglones del Layout ({desglose})...")
 
-            datos = _leer_origen(ws_origen, fila_inicio, fila_fin)
-            problemas, advertencias = _validar_origen(datos, fila_inicio)
+            datos = _leer_origen(secciones)
+            problemas, advertencias = _validar_origen(datos)
             if problemas:
                 raise ValueError(_texto_problemas(problemas, ruta_layout))
+            advertencias = list(avisos_layout) + advertencias
 
             # --- Locate the template columns -----------------------------
             fila_encabezado, columnas = _localizar_destino(ws_destino)
@@ -668,7 +510,7 @@ def generar_poliza_batch(
 
             # --- Paste ---------------------------------------------------
             update_status("✍️  Pegando valores en la plantilla (Débito)...")
-            _pegar_todo(app, ws_origen, ws_destino, columnas, bloques, fila_inicio, fila_fin)
+            _pegar_todo(app, ws_destino, columnas, bloques, secciones)
 
             # --- Read back and compare ------------------------------------
             update_status("🧮 Verificando lo pegado contra el Layout...")
@@ -688,6 +530,7 @@ def generar_poliza_batch(
             resumen = {
                 "ruta":           ruta_final,
                 "origen":         os.path.abspath(ruta_layout),
+                "hojas_origen":   [{"hoja": s["nombre"], "filas": s["filas"]} for s in secciones],
                 "hoja":           str(ws_destino.Name),
                 "filas_origen":   n,
                 "filas_totales":  2 * n,
@@ -696,7 +539,8 @@ def generar_poliza_batch(
                 "total_debito":   round(sumas.get(DEST_DEBITO, 0.0), 2),
                 "total_credito":  round(sumas.get(DEST_CREDITO, 0.0), 2),
                 "total_layout":   round(total_origen, 2),
-                "columnas":       [f"{t['origen']} → {t['destino']}" for t in TRANSFERENCIAS],
+                "columnas":       [f"{titulo_de(t['origen'])} → {t['destino']}"
+                                   for t in TRANSFERENCIAS],
                 "advertencias":   advertencias,
             }
 
@@ -709,8 +553,7 @@ def generar_poliza_batch(
                 pass
             _cerrar_excel(app, wb_destino, pythoncom)
 
-        # Excel is gone, so the temp file is no longer locked. Retry the rename:
-        # the EXCEL.EXE process can take a moment to release it.
+        # Excel is gone; retry the rename while EXCEL.EXE releases the temp file.
         update_status("📦 Dejando el archivo final...")
         for intento in range(INTENTOS):
             try:
@@ -732,12 +575,10 @@ def generar_poliza_batch(
     return resumen
 
 
-# ----------------------------------------------------------------------
-# Standalone run (no GUI, no controller):  python Create_Poliza_Batch.py
-# ----------------------------------------------------------------------
+# --- Standalone run: python Create_Poliza_Batch.py ---
 if __name__ == "__main__":
     print("=== Prueba de 'Póliza Carga Batch' (standalone) ===")
-    layout = input("Ruta del Layout YA procesado (.xlsb): ").strip().strip('"')
+    layout = input("Ruta del Layout OT YA procesado (.xlsx): ").strip().strip('"')
     plantilla = input("Ruta de la plantilla de Póliza Carga Batch (.xlsx): ").strip().strip('"')
 
     try:

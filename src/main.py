@@ -1,14 +1,4 @@
-"""
-RDA Pólizas D&A
-===============
-
-Application entry point. Wires the GUI to the controller.
-
-Reverse of Validación Factura Global: here the consolidation runs first and the
-SAP upload comes afterwards. Today only the consolidation half exists.
-
-Fecha: 2026
-"""
+"""RDA Pólizas D&A — application entry point: wires the GUI to the controller."""
 
 import tkinter as tk
 

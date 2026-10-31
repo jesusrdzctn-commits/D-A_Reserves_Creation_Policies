@@ -1,77 +1,7 @@
-"""
-RDA Pólizas D&A — Reservas_Manuales
-===================================
-
-Pastes the five 'RESERVAS MANUALES <CANAL> <MES>' templates (ECOMM, HD,
-NACIONALES, PROXIMITY, REGIONALES) into the 'Base' sheet of
-'09 Archivo Creacion de Reservas PMF OT.xlsx', month after month, so the
-stakeholder no longer copies and pastes them by hand.
-
-It has its own button ('Traspasar templates'), separate from 'Consolidar
-Variaciones': traspasar_templates() writes a COPY of the Reservas workbook with
-the rows pasted, and the consolidation is then run on that copy. (Consolidacion
-.construir_variaciones() can still paste and consolidate in one call, which the
-tests and the standalone run use.)
-
-Tabs
-----
-Each template has TWO tabs with the same columns, and both are pasted into the same
-'Base': 'Reservas Manuales' (required) and 'Reservas Rentas' (optional, but a
-missing or misnamed one is always reported, never skipped in silence). Rows are
-pasted in that order, file after file.
-
-Column equivalences (template -> 'Base')
-----------------------------------------
-
-    MES                         -> Mes                   (normalised to 'M10-26')
-    CLIENTE                     -> Cadena
-    CANAL                       -> Canal Venta           (the cell, exactly as it comes)
-    BU                          -> BU
-    AGRUPADOR ABIERTO           -> Agrupador
-    MOTIVO                      -> Motivo
-    AGRUPADOR ABIERTO           -> Descripción Motivo    (same source, on purpose)
-    DESCRIPCIÓN DE LA PROVISIÓN -> Descripción de la Provisión
-    RESERVA ($)                 -> Importe
-    INICIO                      -> Inicio Vigencia
-    FIN                         -> Término Vigencia
-    (title / file name)         -> CT                    (the channel; see "Channel" below)
-
-'Solicitante / KAM Resp' has no source any more (the blocks are grouped by
-channel, not by analyst) and stays empty on pasted rows.
-
-Channel
--------
-Each template carries its channel in its TITLE ('LAYOUT CREACION DE RESERVAS D&A
-ECOMM'); the file name repeats it. That channel is what gets written into
-'CT' for EVERY row of the file, which is what keeps a re-run
-idempotent: the rows to replace are found by (month, channel), and they are
-found by the same channel the paste wrote. A row whose own CANAL cell names a
-DIFFERENT channel than the title is an error (wrong rows in the wrong file); a
-CANAL cell with any other label is copied as it is into 'Canal Venta'.
-
-Re-running
-----------
-Pasting a (month, channel) that is already in 'Base' REPLACES those rows instead
-of appending, so a double click never doubles the money in 'Variaciones'. Only
-the channels being pasted are touched: re-sending the corrected HD template does
-not wipe ECOMM, NACIONALES, PROXIMITY or REGIONALES.
-
-Safety rules (the reasons this module is stricter than a copy/paste)
---------------------------------------------------------------------
-  * Everything is read and validated before a single cell is written, and all
-    the problems of all the templates are reported together.
-  * The templates must belong to the month being run (the button's 'Mes' field);
-    a stale file from last month is rejected instead of silently replacing
-    history.
-  * Hidden rows (a leftover filter) are rejected: copy/paste would have skipped
-    them, a script would not, and nobody can tell which was meant.
-  * A row with data but without MES, AGRUPADOR ABIERTO or RESERVA ($) is
-    rejected: 'Variaciones' drops such rows silently, so they would vanish from
-    the matrices without a trace.
-  * The paste is verified against the file on disk, cell by cell, after saving.
-
-This module does NOT depend on SAP, tkinter or Excel: it can be tested on its
-own with `python Reservas_Manuales.py`.
+"""RDA Pólizas D&A — Reservas_Manuales: pastes the five 'RESERVAS MANUALES <CANAL> <MES>' templates (both tabs:
+'Reservas Manuales' required, 'Reservas Rentas' optional) into 'Base' of a COPY of the Reservas workbook.
+The channel comes from the template TITLE (-> 'CT'); re-pasting a (month, channel) REPLACES its rows.
+Validates everything first, rejects templates of another month and verifies the paste on disk.
 """
 
 import math
@@ -89,10 +19,8 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.utils.datetime import from_excel
 
-# NOTE: Consolidacion imports THIS module lazily (inside construir_variaciones),
-# so importing it here at the top is not circular. When Consolidacion.py itself
-# is run as a script it is loaded twice (as __main__ and as 'Consolidacion');
-# that is harmless because everything used here is a pure function or a constant.
+# Consolidacion imports THIS module lazily (inside construir_variaciones), so this top-level import is not circular;
+# run as a script, Consolidacion loads twice (as __main__ and 'Consolidacion'), which is harmless.
 from Consolidacion import (
     COL_CANAL,
     GRUPOS,
@@ -114,17 +42,13 @@ from utils import (
     parse_clave_mes,
 )
 
-# ----------------------------------------------------------------------
-# Template layout
-# ----------------------------------------------------------------------
-# First tab (required). If the workbook has no tab with this name, the only visible
-# tab that is not the rents one is used, whatever it is called.
+# --- Template layout ---
+# First tab (required); without that name the only visible tab that is not the rents one is used.
 HOJA_TEMPLATE = "Reservas Manuales"
 # Second tab (optional): same columns, pasted into the same 'Base'.
 HOJA_RENTAS = "Reservas Rentas"
 
-# (column of 'Base', column of the template). ORDER = order of the summary.
-# 'Canal Venta' takes the CANAL cell as it comes. The channel of the file goes to
+# (column of 'Base', column of the template). ORDER = order of the summary. The file's channel goes to
 # 'CT' (COL_BASE_CANAL below), which has no template column, so it is not listed.
 MAPEO_COLUMNAS = (
     ("Mes",                         "MES"),
@@ -140,9 +64,8 @@ MAPEO_COLUMNAS = (
     ("Término Vigencia",            "FIN"),
 )
 
-# Column of 'Base' that receives the CHANNEL OF THE FILE (ECOMM, HD, NACIONALES,
-# PROXIMITY, REGIONALES), read from the template TITLE, never from a cell. It is
-# the column the 'Variaciones' blocks are grouped by (Consolidacion.COL_CANAL).
+# 'Base' column that receives the CHANNEL OF THE FILE (read from the template TITLE, never a cell);
+# the 'Variaciones' blocks are grouped by it (Consolidacion.COL_CANAL).
 COL_BASE_CANAL = COL_CANAL
 
 # Template columns a data row cannot do without. Anything else may be blank.
@@ -152,11 +75,11 @@ OBLIGATORIAS_TEMPLATE = ("MES", "AGRUPADOR ABIERTO", "RESERVA ($)")
 # back-fill a closed month on purpose.
 PERMITIR_OTROS_MESES = False
 
-MAX_FILAS_ENCABEZADO = 30      # how far down to look for the template header
-MAX_FILAS_EN_BLANCO  = 500     # how far down / across to look to call a tab blank
-MAX_COLUMNAS_BASE    = 200     # sanity bound on the width of 'Base'
-MAX_ERRORES_LISTADOS = 10      # problems shown per template before "...y N más"
-MAX_LARGO_CELDA      = 32767   # Excel's limit for the text of one cell
+MAX_FILAS_ENCABEZADO = 30
+MAX_FILAS_EN_BLANCO  = 500
+MAX_COLUMNAS_BASE    = 200
+MAX_ERRORES_LISTADOS = 10
+MAX_LARGO_CELDA      = 32767
 
 FORMATOS_FECHA = ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y")
 
@@ -168,22 +91,13 @@ for _n, _nombre in MESES_ES.items():
 _MESES_TEXTO.update({"SEPT": 9, "JAN": 1, "APR": 4, "AUG": 8, "DEC": 12})
 
 
-# ----------------------------------------------------------------------
-# Cell-level helpers
-# ----------------------------------------------------------------------
-# Characters that take no room on screen and are NOT removed by str.strip():
-# zero-width space/joiners, direction marks, word joiner, BOM and soft hyphen.
-# A cell holding only these (or only spaces/tabs/NBSP/line breaks) LOOKS empty
-# in Excel but is not, which is what made 'blank' amounts so hard to spot.
+# --- Cell-level helpers ---
+# Zero-width/direction marks, BOM and soft hyphen: invisible, NOT removed by str.strip(), and a cell of only these LOOKS empty.
 _INVISIBLES = re.compile("[\u00ad\u200b-\u200f\u2060\ufeff]")
 
 
 def _es_vacio(valor):
-    """
-    True for a cell that holds nothing visible: None, NaN, or text made only of
-    whitespace (spaces, tabs, line breaks, NBSP, ideographic space...) and
-    zero-width characters.
-    """
+    """True for a cell with nothing visible: None, NaN, whitespace-only text or zero-width characters."""
     if valor is None:
         return True
     if isinstance(valor, float) and math.isnan(valor):
@@ -204,13 +118,8 @@ def _limpiar(valor):
 
 
 def clave_de_mes(valor):
-    """
-    A 'MES' cell -> month key as 'Base' writes it ('M10-26'). Raises ValueError.
-
-    Accepts the key itself, a real date, 'OCT 26' / 'octubre 2026' / 'Oct-26'
-    and '2026-10'. Anything else is refused rather than guessed: a wrong month
-    here would replace the wrong rows of history.
-    """
+    """'MES' cell -> month key as 'Base' writes it ('M10-26'); raises ValueError.
+    Accepts the key, a real date, 'OCT 26' / 'octubre 2026' / 'Oct-26' and '2026-10'; anything else is refused, never guessed."""
     if _es_vacio(valor):
         raise ValueError("está vacío")
 
@@ -238,13 +147,7 @@ def clave_de_mes(valor):
 
 
 def fecha_de(valor):
-    """
-    An 'INICIO' / 'FIN' cell -> (datetime|None, aviso|None).
-
-    A real date, an Excel serial number or a dd/mm/yyyy style text become a
-    datetime. Text that is none of those is kept as it came, with a warning:
-    these two columns are informative and must not stop a run.
-    """
+    """'INICIO'/'FIN' cell -> (datetime|None, aviso|None). Unparseable text is kept as it came with a warning: never fatal."""
     if _es_vacio(valor):
         return None, None
     if isinstance(valor, datetime):
@@ -267,15 +170,8 @@ def fecha_de(valor):
 
 
 def importe_de(valor):
-    """
-    A 'RESERVA ($)' cell -> finite float. Raises ValueError.
-
-    Real numbers pass. Text is accepted when it is an amount once the blanks
-    inside it are gone: ' 1,234.50 ', '1 234.50', '$1,234.50', '(500.00)',
-    '500.00-'. Refused, with the reason: an empty/blank cell (the caller reports
-    those by cell), a bare '-' or '+' (parsed elsewhere as 0: an amount is never
-    inferred from a dash), Excel errors ('#REF!') and anything non-numeric.
-    """
+    """'RESERVA ($)' cell -> finite float; raises ValueError. Accepts ' 1,234.50 ', '$1,234.50', '(500.00)', '500.00-'.
+    Refuses blanks (reported by cell), a bare '-'/'+', Excel errors and non-numeric text."""
     if _es_vacio(valor):
         raise ValueError(f"está {_como_esta_vacio(valor)}")
     if isinstance(valor, bool):
@@ -322,9 +218,7 @@ def _listar(errores, maximo=MAX_ERRORES_LISTADOS):
     return texto
 
 
-# ----------------------------------------------------------------------
-# Reading ONE template
-# ----------------------------------------------------------------------
+# --- Reading ONE template ---
 def _hoja_unica(wb, nombre, titulo):
     """The tab called `titulo` (case/accent-insensitive), or None. Two of them is an error."""
     objetivo = norm_texto(titulo)
@@ -338,21 +232,9 @@ def _hoja_unica(wb, nombre, titulo):
 
 
 def _hojas_del_template(wb, nombre):
-    """
-    The tabs of a template to paste, in paste order, plus the warnings found
-    while choosing them: ([(ws, etiqueta)], [advertencias]).
-
-        'Reservas Manuales'  etiqueta 'Manuales'  required
-        'Reservas Rentas'    etiqueta 'Rentas'    optional; same columns as the first
-
-    Both go into the SAME 'Base'. Rules, all of them to avoid dropping money
-    silently:
-      * No 'Reservas Manuales' tab: the only visible tab is used (older
-        templates), but never one that looks like the rents tab.
-      * No 'Reservas Rentas' tab: allowed, and reported. A tab that looks like it
-        ('Rentas', 'RENTAS 2026'...) under another name is an ERROR, not a guess.
-      * A hidden tab is still read, with a warning.
-    """
+    """([(ws, etiqueta)], [advertencias]): the tabs of a template to paste, in paste order, into the SAME 'Base'.
+    'Reservas Manuales' is required (older templates: the only visible tab, never one that looks like rents);
+    'Reservas Rentas' may be missing (reported) but a look-alike name is an ERROR; a hidden tab is read, with a warning."""
     avisos = []
     manuales = _hoja_unica(wb, nombre, HOJA_TEMPLATE)
     rentas = _hoja_unica(wb, nombre, HOJA_RENTAS)
@@ -398,11 +280,7 @@ def _hojas_del_template(wb, nombre):
 
 
 def _hoja_en_blanco(ws):
-    """
-    True when no cell in the first MAX_FILAS_EN_BLANCO rows / columns of the tab
-    holds anything visible. Bounded on purpose: a tab whose formatting stretches
-    to the last row of the sheet must not make the check walk a million cells.
-    """
+    """True when nothing visible sits in the first MAX_FILAS_EN_BLANCO rows/columns (bounded: formatting can span the sheet)."""
     return not any(
         not _es_vacio(valor)
         for fila in ws.iter_rows(min_row=1, max_row=min(ws.max_row, MAX_FILAS_EN_BLANCO),
@@ -413,12 +291,7 @@ def _hoja_en_blanco(ws):
 
 
 def _localizar_encabezado_template(ws, nombre):
-    """
-    (fila_encabezado, {encabezado normalizado: columna}) of ONE tab of a template.
-
-    The header row is found by content (all the mapped headers present), not by
-    position, because the banner rows above it have changed before.
-    """
+    """(fila_encabezado, {normalized header: column}) of ONE tab, found by content (all mapped headers), not position."""
     requeridos = {norm_texto(t) for _, t in MAPEO_COLUMNAS}
 
     for fila, valores in enumerate(
@@ -446,10 +319,7 @@ def _localizar_encabezado_template(ws, nombre):
 
 
 def _grupo_del_titulo(ws, fila_encabezado, nombre, grupos):
-    """
-    Index of the channel block named by the TITLE of one tab (any text above its
-    header), or None when the title names none. Two channels is an error.
-    """
+    """Index of the channel block named by a tab's TITLE (text above its header), or None. Two channels is an error."""
     if fila_encabezado <= 1:
         return None
     del_titulo = set()
@@ -469,15 +339,8 @@ def _grupo_del_titulo(ws, fila_encabezado, nombre, grupos):
 
 
 def _grupo_del_archivo(titulos, nombre, grupos):
-    """
-    Index of the channel block a template FILE belongs to, read from the TITLE of
-    its tabs and cross-checked with the FILE NAME.
-
-    `titulos` is [(tab title, index of the channel its title names | None)].
-    Returns (indice, fuente). Raises ValueError when the channel cannot be
-    established or two sources disagree (tabs with different channels, or a title
-    and a file name that point at different channels).
-    """
+    """(indice, fuente) of the channel block a template FILE belongs to: its tab TITLES cross-checked with the FILE NAME.
+    `titulos` is [(tab title, channel index | None)]. Raises ValueError when the channel cannot be established or sources disagree."""
     distintos = {i for _, i in titulos if i is not None}
     if len(distintos) > 1:
         detalle = ", ".join(
@@ -507,14 +370,9 @@ def _grupo_del_archivo(titulos, nombre, grupos):
 
 
 def _leer_hoja(ws, etiqueta, fila_enc, columnas, canal, indice_grupo, grupos):
-    """
-    Read the data rows of ONE tab of a template.
-
-    Never raises for a bad cell: every problem comes back in 'errores' (prefixed
-    with the tab name) so the caller can report all the tabs of all the files
-    together. The cells of 'Base' are keyed by the 'Base' column name; the value
-    of 'CT' is the channel of the FILE, not a cell.
-    """
+    """Read the data rows of ONE tab. Never raises for a bad cell: every problem comes back in 'errores'
+    (prefixed with the tab name) so all tabs of all files are reported together.
+    'CT' holds the channel of the FILE, not a cell."""
     col = {tpl: columnas[norm_texto(tpl)] for _, tpl in MAPEO_COLUMNAS}
     ancho = max(col.values())
     prefijo = f"[{ws.title}] "
@@ -537,9 +395,7 @@ def _leer_hoja(ws, etiqueta, fila_enc, columnas, canal, indice_grupo, grupos):
         # --- required cells -------------------------------------
         faltan = [t for t in OBLIGATORIAS_TEMPLATE if _es_vacio(leidos[t])]
         if "RESERVA ($)" in faltan:
-            # Reported apart, by cell and ALL of them together: the amount is
-            # the one that is hard to see (a lone space looks like an empty
-            # cell and an empty cell looks like a space).
+            # Reported apart, by cell and all together: a lone space looks like an empty cell and vice versa.
             faltan.remove("RESERVA ($)")
             reserva_vacia.append(
                 (f"{ws.title}!{get_column_letter(col['RESERVA ($)'])}{n}",
@@ -568,10 +424,8 @@ def _leer_hoja(ws, etiqueta, fila_enc, columnas, canal, indice_grupo, grupos):
             fila_ok = False
             importe = None
 
-        # --- channel of the row itself --------------------------
-        # The CANAL cell is copied as it comes into 'Canal Venta'. It only
-        # matters here when it names ANOTHER of the five channels: that is a row
-        # of a different file sitting in this one.
+        # --- channel of the row itself ---
+        # CANAL is copied as it comes; it matters only when it names ANOTHER of the five channels (a row of a different file).
         celda_canal = leidos["CANAL"]
         if not _es_vacio(celda_canal):
             propio = resolver_grupo(str(celda_canal), grupos)
@@ -631,18 +485,9 @@ def _leer_hoja(ws, etiqueta, fila_enc, columnas, canal, indice_grupo, grupos):
 
 
 def leer_template(ruta, clave_esperada, grupos=None):
-    """
-    Read and validate ONE template (all its tabs). Returns a dict, or raises
-    ValueError with every problem found in the file (not just the first).
-
-    Returns:
-        {ruta, nombre, hoja, hojas, fila_encabezado, grupo, canal, fuente_canal,
-         filas: [{'fila': n, 'hoja': tab, 'valores': {Base column: value}}],
-         total, advertencias}
-
-        'hojas' is [{'hoja', 'etiqueta', 'filas', 'total'}], one per tab read;
-        'hoja' / 'fila_encabezado' are those of the first one.
-    """
+    """Read and validate ONE template (all its tabs); raises ValueError with every problem found, not just the first.
+    Returns {ruta, nombre, hoja, hojas, fila_encabezado, grupo, canal, fuente_canal, total, advertencias,
+    filas: [{'fila', 'hoja', 'valores': {Base column: value}}]}; 'hojas' is [{'hoja', 'etiqueta', 'filas', 'total'}]."""
     grupos = grupos if grupos is not None else GRUPOS
     ruta = os.path.abspath(ruta)
     nombre = os.path.basename(ruta)
@@ -666,8 +511,7 @@ def leer_template(ruta, clave_esperada, grupos=None):
         hojas, advertencias = _hojas_del_template(wb, nombre)
         advertencias = list(advertencias)
 
-        # Tabs with something in them; a completely blank tab is skipped (and
-        # said), a tab with a header but no rows is read and simply gives 0 rows.
+        # A completely blank tab is skipped (and reported); one with a header but no rows is read and gives 0 rows.
         con_datos = []
         for ws, etiqueta in hojas:
             if _hoja_en_blanco(ws):
@@ -780,23 +624,11 @@ def leer_template(ruta, clave_esperada, grupos=None):
         wb.close()
 
 
-# ----------------------------------------------------------------------
-# Planning the paste (pure: reads, validates, writes nothing)
-# ----------------------------------------------------------------------
+# --- Planning the paste (pure: reads, validates, writes nothing) ---
 def planificar_pegado(df_base, fila_encabezado, ultima_fila, rutas, clave_actual, grupos=None):
-    """
-    Read every template, validate the lot and work out exactly what the paste
-    will do. Nothing is written anywhere.
-
-    Args:
-        df_base: DataFrame from Consolidacion.leer_base().
-        fila_encabezado / ultima_fila: the other two values leer_base() returns.
-        rutas: template paths (the five, or any subset).
-        clave_actual: month key being run ('M10-26').
-
-    Returns the plan dict used by aplicar_plan_a_df / aplicar_plan_a_libro /
-    verificar_pegado / resumir_pegado.
-    """
+    """Read every template, validate the lot and work out what the paste will do; writes nothing.
+    df_base, fila_encabezado and ultima_fila come from Consolidacion.leer_base(); clave_actual is the month being run.
+    Returns the plan dict used by aplicar_plan_a_df / aplicar_plan_a_libro / verificar_pegado / resumir_pegado."""
     grupos = grupos if grupos is not None else GRUPOS
 
     # --- the selection itself ------------------------------------------
@@ -848,10 +680,8 @@ def planificar_pegado(df_base, fila_encabezado, ultima_fila, rutas, clave_actual
     archivos.sort(key=lambda a: a["grupo"])           # block order, deterministic
     pegados = {a["grupo"] for a in archivos}
 
-    # --- rows of an OLDER paste: channel in 'Canal Venta', 'CT' still blank ----
-    # The previous version of the button wrote the channel into 'Canal Venta'. Those
-    # rows have no 'CT', so the (month, channel) lookup below cannot see them and
-    # the new paste would land on top of them, doubling the money. Refuse instead.
+    # --- rows of an OLDER paste: channel in 'Canal Venta', 'CT' still blank ---
+    # Those rows are invisible to the (month, channel) lookup below, so a new paste would double the money: refuse instead.
     if "_canal_venta" in df_base.columns:
         sin_ct = df_base[(df_base["_mes"] == clave_actual) & (df_base["_canal"] == "")]
         viejas = {}
@@ -909,10 +739,7 @@ def planificar_pegado(df_base, fila_encabezado, ultima_fila, rutas, clave_actual
 
 
 def previsualizar_pegado(ruta_libro, rutas_templates, mes=None, grupos=None):
-    """
-    Plan the paste against the real workbook WITHOUT writing anything: what the
-    GUI shows in its confirmation box. Returns the plan.
-    """
+    """Plan the paste against the real workbook WITHOUT writing: what the confirmation box shows. Returns the plan."""
     _, clave_actual = claves_mes_actual_y_anterior(mes)
     df, fila_encabezado, ultima_fila = leer_base(ruta_libro)
     return planificar_pegado(df, fila_encabezado, ultima_fila, rutas_templates,
@@ -920,10 +747,7 @@ def previsualizar_pegado(ruta_libro, rutas_templates, mes=None, grupos=None):
 
 
 def aplicar_plan_a_df(df, plan):
-    """
-    The working DataFrame as it will look after the paste: the replaced rows
-    gone, the new ones appended. This is what the matrices are computed from.
-    """
+    """The working DataFrame as it will look after the paste (replaced rows gone, new ones appended): the matrices' source."""
     quitar = set(plan["filas_a_reemplazar"])
     conservadas = df[~df["_nfila"].isin(quitar)]
 
@@ -938,25 +762,10 @@ def aplicar_plan_a_df(df, plan):
     return pd.concat([conservadas, nuevas], ignore_index=True)
 
 
-# ----------------------------------------------------------------------
-# Applying the plan to the workbook (openpyxl, on the Output copy)
-# ----------------------------------------------------------------------
+# --- Applying the plan to the workbook (openpyxl, on the Output copy) ---
 def _eliminar_filas(ws, filas, ultima_col, ultima_fila):
-    """
-    Remove sheet rows `filas`, closing the gaps; returns the new last row.
-
-    ws.delete_rows() shifts cells but does NOT re-point formulas, so a formula
-    like =I9*2 would keep saying row 9 after moving to row 7. move_range with
-    translate=True re-points the formulas that live in the moved cells, and it
-    also drags up any pre-filled formulas that live BELOW the data, so the move
-    is limited to the rows that actually hold data.
-
-    ONE pass, top to bottom: every run of kept rows between two deleted rows is
-    moved exactly once, up by the number of rows deleted before it. (Moving the
-    whole tail once per deleted block would be quadratic: 400 scattered blocks
-    over 3,000 rows took 80 seconds.) Going top-down is what makes it safe: a
-    run only ever lands on rows that were deleted or already moved away.
-    """
+    """Remove sheet rows `filas`, closing the gaps; returns the new last row. ONE top-down pass moves each kept run once
+    (move_range translate=True re-points formulas; delete_rows would not, and a per-block tail move was quadratic)."""
     borradas = sorted(set(filas))
     if not borradas:
         return ultima_fila
@@ -965,14 +774,12 @@ def _eliminar_filas(ws, filas, ultima_col, ultima_fila):
     for i, fila in enumerate(borradas):
         inicio = fila + 1
         fin = borradas[i + 1] - 1 if i + 1 < len(borradas) else ultima_fila
-        if fin >= inicio:                       # consecutive deleted rows leave no run
+        if fin >= inicio:
             ws.move_range(f"A{inicio}:{letra}{fin}", rows=-(i + 1), translate=True)
 
     nueva_ultima = ultima_fila - len(borradas)
 
-    # The rows below the new last row are vacated, or still hold the deleted rows
-    # that sat near the bottom (nothing moved onto them). Blank them so nothing
-    # of the removed rows survives.
+    # Blank the rows below the new last row: they may still hold deleted rows that nothing moved onto.
     for r in range(nueva_ultima + 1, ultima_fila + 1):
         for c in range(1, ultima_col + 1):
             celda = ws.cell(row=r, column=c)
@@ -1003,12 +810,8 @@ def _ajustar_rangos(ws, fila_encabezado, ultima_fila):
 
 
 def aplicar_plan_a_libro(wb, plan):
-    """
-    Replace the planned rows of 'Base' and append the new ones, in the open
-    openpyxl workbook `wb` (a COPY; the caller saves it).
-
-    Returns the info dict verificar_pegado() and resumir_pegado() need.
-    """
+    """Replace the planned rows of 'Base' and append the new ones in the open openpyxl workbook `wb` (a COPY; the caller saves).
+    Returns the info dict verificar_pegado() and resumir_pegado() need."""
     if HOJA_BASE not in wb.sheetnames:
         raise ValueError(f"El archivo no tiene una pestaña llamada '{HOJA_BASE}'.")
     ws = wb[HOJA_BASE]
@@ -1096,13 +899,11 @@ def aplicar_plan_a_libro(wb, plan):
                 valor = valores[destino[c]]
                 celda.value = valor
                 if isinstance(valor, str):
-                    # A description that starts with '=' must stay TEXT, not
-                    # become a formula (openpyxl would otherwise store it as one).
+                    # A description starting with '=' must stay TEXT (openpyxl would store a formula).
                     celda.data_type = "s"
             elif (celda.value is None and modelo is not None
                   and isinstance(modelo.value, str) and modelo.value.startswith("=")):
-                # Unmapped column that carries a formula in the model row (e.g.
-                # the untitled column M): carry it down, re-pointed to this row.
+                # Unmapped column with a formula in the model row (e.g. the untitled column M): carry it down, re-pointed.
                 celda.value = Translator(
                     modelo.value, origin=modelo.coordinate
                 ).translate_formula(celda.coordinate)
@@ -1118,9 +919,7 @@ def aplicar_plan_a_libro(wb, plan):
     }
 
 
-# ----------------------------------------------------------------------
-# Verification and summary
-# ----------------------------------------------------------------------
+# --- Verification and summary ---
 def _coincide(esperado, leido):
     """Does the value read back from disk match what the plan said to write?"""
     if esperado is None:
@@ -1136,10 +935,7 @@ def _coincide(esperado, leido):
 
 
 def verificar_pegado(ruta, plan, info):
-    """
-    Re-open the SAVED file and compare the pasted block with the plan, cell by
-    cell, plus the control total. Raises RuntimeError on any difference.
-    """
+    """Re-open the SAVED file and compare the pasted block with the plan cell by cell, plus the control total (RuntimeError on any difference)."""
     wb = load_workbook(ruta, read_only=True, data_only=False)
     try:
         ws = wb[HOJA_BASE]
@@ -1183,10 +979,7 @@ def verificar_pegado(ruta, plan, info):
 
 
 def resumir_pegado(plan, info=None):
-    """
-    Plain-data summary of a paste (or, with info=None, of a PLANNED paste) for
-    the popups. Safe to show: contains no workbook objects.
-    """
+    """Plain-data summary of a paste (info=None: of a PLANNED paste) for the popups; holds no workbook objects."""
     resumen = {
         "mes":                 plan["mes"],
         "archivos": [
@@ -1211,20 +1004,13 @@ def resumir_pegado(plan, info=None):
     return resumen
 
 
-# ----------------------------------------------------------------------
-# The paste as a step of its own (the 'Traspasar templates' button)
-# ----------------------------------------------------------------------
+# --- The paste as a step of its own (the 'Traspasar templates' button) ---
 _SUFIJO_TRASPASO = re.compile(r"_Reservas_M\d{2}-\d{2}(_\d+)?$")
 
 
 def _ruta_copia_traspaso(ruta_libro, ruta_salida, clave_actual):
-    """
-    Where the pasted copy goes: '<name>_Reservas_M10-26.xlsx' in 'Output'.
-
-    A name that already carries that suffix (the person is re-running on a
-    previous result) is not suffixed twice. If the result would land ON the
-    source file, '_2', '_3'... is used instead: the source is never overwritten.
-    """
+    """Where the pasted copy goes: '<name>_Reservas_M10-26.xlsx' in 'Output' (suffix never doubled).
+    If it would land ON the source, '_2', '_3'... is used: the source is never overwritten."""
     if not ruta_salida:
         ruta_salida = carpeta_output_desde_input(os.path.dirname(os.path.abspath(ruta_libro)))
     os.makedirs(ruta_salida, exist_ok=True)
@@ -1241,18 +1027,10 @@ def _ruta_copia_traspaso(ruta_libro, ruta_salida, clave_actual):
 
 def traspasar_templates(ruta_libro, rutas_templates, mes=None, ruta_salida=None,
                         grupos=None, callback_status=None):
-    """
-    Paste the 'RESERVAS MANUALES' templates into 'Base' of a COPY of the
-    Reservas workbook and verify the result on disk. Nothing else is touched:
-    no 'Variaciones', no PivotTables (that is the other button).
-
-    Returns the paste summary of resumir_pegado() plus:
-        'ruta'  the copy that now holds the pasted rows (feed it to the
-                consolidation step)
-    Raises ValueError / FileNotFoundError / PermissionError like the rest of
-    the pipeline; on ANY failure the copy is removed and the original is
-    untouched.
-    """
+    """Paste the 'RESERVAS MANUALES' templates into 'Base' of a COPY of the Reservas workbook and verify it on disk
+    (no 'Variaciones', no PivotTables: that is the other button). Returns resumir_pegado() plus 'ruta', the copy
+    to feed the consolidation. Raises ValueError/FileNotFoundError/PermissionError; on ANY failure the copy is
+    removed and the original untouched."""
     def estado(mensaje):
         if callback_status:
             callback_status(mensaje)
@@ -1297,10 +1075,7 @@ def traspasar_templates(ruta_libro, rutas_templates, mes=None, ruta_salida=None,
     return resumen
 
 
-# ----------------------------------------------------------------------
-# Standalone run (no GUI, no controller):  python Reservas_Manuales.py
-# Plans the paste and prints it; writes nothing.
-# ----------------------------------------------------------------------
+# --- Standalone run: python Reservas_Manuales.py (plans the paste and prints it; writes nothing) ---
 if __name__ == "__main__":
     print("=== Prueba de pegado de Reservas Manuales (standalone, NO escribe) ===")
     ruta = input("Ruta del archivo de Reservas (.xlsx): ").strip().strip('"')

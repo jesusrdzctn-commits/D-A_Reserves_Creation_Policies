@@ -34,12 +34,7 @@ def install_pyinstaller():
 
 
 def check_pywin32():
-    """
-    pywin32 es lo que le permite a Create_Poliza_SAP.py y Create_Poliza_Batch.py
-    manejar Excel (el archivo WHSL es .xlsb y sólo Excel lo abre de forma
-    nativa). Sin esto, el botón de 'PÓLIZA SAP' truena en tiempo de ejecución,
-    no al compilar.
-    """
+    """pywin32 lets Create_Poliza_SAP/Batch drive Excel; without it the 'PÓLIZA SAP' button fails at run time, not at build time."""
     try:
         import win32com.client  # noqa: F401
         print("✅ pywin32 ya está instalado")
@@ -56,44 +51,36 @@ def create_executable():
 
     cmd = [
         "pyinstaller",
-        # --onedir: una CARPETA con el .exe adentro. Arranca más rápido que
-        # --onefile y el antivirus corporativo la marca con menos frecuencia.
-        # Para enviarla al stakeholder, se comprime la carpeta en un .zip.
+        # --onedir: a FOLDER with the .exe inside; starts faster than --onefile and trips corporate antivirus less (zip it to send).
         "--onedir",
-        "--windowed",              # Sin ventana de consola (app con GUI)
+        "--windowed",
         f"--name={NOMBRE_APP}",
-        "--icon=NONE",             # Sin icono personalizado (cambiar si hay un .ico)
-        "--clean",                 # Limpia caché de builds anteriores
-        "--noconfirm",             # No pregunta al sobrescribir dist/ y build/
+        "--icon=NONE",
+        "--clean",
+        "--noconfirm",
 
-        # Módulos que PyInstaller no detecta solo.
-        # Proceso 1 ('Variaciones') — escribe el .xlsx con openpyxl:
+        # Modules PyInstaller does not detect on its own.
+        # Process 1 ('Variaciones') — writes the .xlsx with openpyxl:
         "--hidden-import=openpyxl",
         "--hidden-import=openpyxl.cell._writer",
         "--hidden-import=pandas",
 
-        # Proceso 2 ('PÓLIZA SAP') y las tablas dinámicas comparativas — los dos
-        # manejan Excel por COM. PyInstaller no rastrea estos imports porque
-        # utils.abrir_excel() los hace DENTRO de la función (a propósito: así el
-        # módulo se puede importar en una máquina sin Excel y sólo truena si de
-        # verdad se usa el botón).
+        # Process 2 ('PÓLIZA SAP') and the comparison pivots drive Excel through COM; utils.abrir_excel() imports
+        # win32com INSIDE the function (so the module still imports without Excel), which PyInstaller cannot trace.
         "--hidden-import=win32com",
         "--hidden-import=win32com.client",
         "--hidden-import=pythoncom",
         "--hidden-import=pywintypes",
 
-        # Consolidacion.py importa Comparativos DENTRO de la función, por la
-        # misma razón. Se declara por si el análisis de PyInstaller no lo ve.
+        # Consolidacion.py imports Comparativos inside the function for the same reason; declared in case the analysis misses it.
         "--hidden-import=Comparativos",
 
-        # Consolidacion.py también importa Reservas_Manuales DENTRO de la
-        # función (el módulo importa a Consolidacion, así que un import al
-        # inicio sería circular). El controller sí lo importa arriba, pero se
-        # declara aquí para no depender de eso.
+        # Consolidacion.py also imports Reservas_Manuales inside the function (a top-level import would be circular);
+        # declared here so the build does not depend on the controller importing it.
         "--hidden-import=Reservas_Manuales",
         "--hidden-import=openpyxl.formula.translate",
 
-        # Punto de entrada
+        # Entry point
         "main.py",
     ]
 

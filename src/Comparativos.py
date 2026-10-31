@@ -1,48 +1,7 @@
-"""
-RDA Pólizas D&A — Comparativos
-===============================
-
-Builds two extra sheets of '07 Archivo Creacion de Reservas PMF OT.xlsx', each
-holding TWO REAL Excel PivotTables stacked vertically:
-
-    'Comparativo BU Mes'          Rows: BU         Columns: Mes   Values: Σ Importe
-    'Comparativo Agrupador Mes'   Rows: Agrupador  Columns: Mes   Values: Σ Importe
-
-In both sheets the TOP table shows LAST year's months and the BOTTOM one the
-CURRENT year's months, so the two years sit one above the other:
-
-    A1   Comparativo BU vs Mes                  <- sheet heading (blue)
-    A3   Creaciones 2025                        <- grey banner
-    A4   [PivotTable, columns filtered to M01-25 ... M12-25]
-    ...
-    A??  Creaciones 2026                        <- grey banner
-    A??  [PivotTable, columns filtered to M01-26 ... M12-26]
-
-Only the months that actually exist in 'Base' become columns (same as a pivot
-you would build by hand), and both Grand Totals are on: the column on the right
-is the year total per BU/Agrupador, the row at the bottom is the total per month.
-
-Why win32com and not openpyxl
------------------------------
-openpyxl can READ and PRESERVE a PivotTable that already exists, but it cannot
-CREATE one: a pivot needs its own cache (xl/pivotCache/*.xml) wired to the
-source range, and openpyxl ships no writer for that. Excel COM asks Excel itself
-to build it, so what lands in the file is a real PivotTable — with its filter
-dropdowns and its 'Actualizar' button — exactly like the 16 pivots the workbook
-already carries.
-
-The trade-off, stated out loud: this module needs Excel installed on whatever
-machine runs the .exe. So it is called as an OPTIONAL last step of
-construir_variaciones(): if Excel or pywin32 is missing, 'Variaciones' is
-already written and saved and the run reports the comparativos as skipped
-instead of failing.
-
-ORDER MATTERS: openpyxl writes and saves FIRST, this module opens the saved file
-SECOND. Never the other way around — an openpyxl round-trip over a freshly
-created pivot cache is precisely the kind of thing that loses it.
-
-This module does NOT depend on pandas, openpyxl, SAP or tkinter: it can be
-tested on its own with `python Comparativos.py`.
+"""RDA Pólizas D&A — Comparativos: builds 'Comparativo BU Mes' and 'Comparativo Agrupador Mes', each with TWO REAL Excel
+PivotTables stacked (top: last year's months, bottom: current year's): Σ Importe by BU / Agrupador x Mes, grand totals on.
+Uses win32com because openpyxl cannot CREATE a pivot cache; it runs LAST and OPTIONALLY on the file openpyxl already saved
+(never the other way round: an openpyxl round-trip loses a fresh pivot cache). No Excel/pywin32 -> reported as skipped.
 """
 
 import os
@@ -57,49 +16,36 @@ from utils import (
     parse_clave_mes,
 )
 
-# ----------------------------------------------------------------------
-# Excel COM constants
-# ----------------------------------------------------------------------
-# Hard-coded instead of using win32com.client.constants, for the same reason as
-# in Poliza_SAP.py: those only exist after gencache.EnsureDispatch(), which is
-# exactly the call that breaks inside a PyInstaller .exe. Plain numbers always
-# work.
-XL_UP           = -4162   # xlUp
+# Excel COM constants as plain numbers: win32com.client.constants breaks inside a PyInstaller .exe.
+XL_UP           = -4162
 XL_DATABASE     = 1       # xlDatabase          (source is a worksheet range)
-XL_ROW_FIELD    = 1       # xlRowField
-XL_COLUMN_FIELD = 2       # xlColumnField
-XL_SUM          = -4157   # xlSum
-XL_ASCENDING    = 1       # xlAscending
+XL_ROW_FIELD    = 1
+XL_COLUMN_FIELD = 2
+XL_SUM          = -4157
+XL_ASCENDING    = 1
 XL_TABULAR_ROW  = 1       # xlTabularRow        (row field shown in its own column)
 
 
-# ----------------------------------------------------------------------
-# Sheets and source columns
-# ----------------------------------------------------------------------
+# --- Sheets and source columns ---
 HOJA_BASE = "Base"
 
 HOJA_COMPARATIVO_BU        = "Comparativo BU Mes"
 HOJA_COMPARATIVO_AGRUPADOR = "Comparativo Agrupador Mes"
 
-# Headers as they read in 'Base'. Matched by NORMALISED name (trimmed,
-# upper-cased, accent-free), because the real file ships 'Importe ' with a
-# trailing space.
+# Headers as they read in 'Base', matched by NORMALISED name ('Importe ' ships with a trailing space).
 COL_MES       = "Mes"
 COL_BU        = "BU"
 COL_AGRUPADOR = "Agrupador"
 COL_IMPORTE   = "Importe"
 
-# The header row of 'Base' is not row 1 (empty rows plus a 'Seleccionar /
-# Escritura / Formula' hint row sit above it), so it is detected by looking for
-# 'Mes' + 'Agrupador'. This is only the fallback if detection fails.
+# The 'Base' header row is detected by 'Mes' + 'Agrupador' (padding rows above it have changed); this is only the fallback.
 FILA_ENCABEZADO_BASE_DEFAULT = 7
 
 # How far to look when hunting for the header row / reading the header itself.
 MAX_FILAS_BUSQUEDA   = 30
 MAX_COLUMNAS_LECTURA = 40
 
-# Upper bound on the source range, so a corrupt sheet cannot make us build a
-# pivot cache over a million rows.
+# Upper bound on the source range, so a corrupt sheet cannot build a pivot cache over a million rows.
 MAX_FILAS = 200_000
 
 # The two sheets to build: (sheet name, heading, row field, pivot name prefix).
@@ -109,26 +55,21 @@ COMPARATIVOS = [
 ]
 
 
-# ----------------------------------------------------------------------
-# Layout
-# ----------------------------------------------------------------------
+# --- Layout ---
 FILA_ENCABEZADO_HOJA = 1   # sheet heading
 FILA_PRIMERA_TABLA   = 4   # first pivot lands here; its banner goes one row above
 FILAS_ENTRE_TABLAS   = 3   # blank rows between one pivot's last row and the next banner
 
 ANCHO_COLUMNA_A = 31.33    # same as the 'Concepto' column of 'Variaciones'
 
-# Caption of the value field. It must NOT be identical to the source field name
-# ('Importe '), or Excel rejects it as a duplicate.
+# Caption of the value field: must differ from the source field name ('Importe '), or Excel rejects it.
 NOMBRE_CAMPO_VALOR = "Suma de Importe"
 
 # Banner above each pivot. Same wording as the 'Variaciones' sheet.
 TITULO_TABLA = "Creaciones {anio}"
 
 
-# ----------------------------------------------------------------------
-# Styles — same palette as the 'Variaciones' sheet
-# ----------------------------------------------------------------------
+# --- Styles — same palette as the 'Variaciones' sheet ---
 GRIS_CREACIONES = "BFBFBF"   # banner above each pivot
 AZUL_TITULO     = "DCE6F2"   # sheet heading
 
@@ -137,38 +78,21 @@ TAM    = 10
 
 CONTABLE_2 = '_-* #,##0.00_-;\\-* #,##0.00_-;_-* "-"??_-;_-@_-'
 
-# Built-in PivotTable style. Set to None to leave Excel's default. An unknown
-# name is ignored rather than fatal — a cosmetic detail must never kill a run.
+# Built-in PivotTable style (None = Excel's default); an unknown name is ignored: cosmetics must never kill a run.
 ESTILO_TABLA = "PivotStyleMedium9"
 
 
 def _color_excel(rgb_hex):
-    """
-    'DCE6F2' -> the integer Excel's Interior.Color expects.
-
-    Excel stores colours BACKWARDS: the low byte is RED and the high byte is
-    BLUE (BGR), not the RGB order every designer writes. Hand it 0xDCE6F2 raw
-    and a pale blue comes out a pale orange. Same three cans of paint, opposite
-    order on the shelf.
-    """
+    """'DCE6F2' -> the integer Interior.Color expects: Excel stores colours as BGR, not RGB."""
     r = int(rgb_hex[0:2], 16)
     g = int(rgb_hex[2:4], 16)
     b = int(rgb_hex[4:6], 16)
     return r + (g << 8) + (b << 16)
 
 
-# ----------------------------------------------------------------------
-# Reading the 'Base' sheet through COM
-# ----------------------------------------------------------------------
+# --- Reading the 'Base' sheet through COM ---
 def _bloque(ws, fila1, col1, fila2, col2):
-    """
-    Read a rectangle in ONE COM call and always return a list of rows.
-
-    Every attribute hop across the COM boundary costs about a millisecond, so
-    reading 30x40 cells one at a time is 1,200 round trips. `Range.Value` over
-    the whole rectangle is a single trip. Excel collapses a 1x1 range to a
-    scalar and a 1xN range to a flat tuple, so both shapes are normalised here.
-    """
+    """Read a rectangle in ONE COM call as a list of rows (1x1 and 1xN ranges come back collapsed, so shapes are normalised)."""
     valores = ws.Range(ws.Cells(fila1, col1), ws.Cells(fila2, col2)).Value
 
     if valores is None:
@@ -181,14 +105,7 @@ def _bloque(ws, fila1, col1, fila2, col2):
 
 
 def _localizar_fila_encabezado(ws):
-    """
-    Find the 1-based header row of 'Base'.
-
-    The sheet carries empty rows and a hint row above the real headers, and that
-    padding has changed before. Scanning the top of the sheet for 'Mes' +
-    'Agrupador' survives somebody inserting a row — same trick the openpyxl side
-    uses, so both modules agree on where the table starts.
-    """
+    """1-based header row of 'Base': scans the top of the sheet for 'Mes' + 'Agrupador' (same trick as the openpyxl side)."""
     buscados = {norm_texto(COL_MES), norm_texto(COL_AGRUPADOR)}
     filas = _bloque(ws, 1, 1, MAX_FILAS_BUSQUEDA, MAX_COLUMNAS_LECTURA)
 
@@ -199,15 +116,8 @@ def _localizar_fila_encabezado(ws):
 
 
 def _encabezados(ws, fila_encabezado):
-    """
-    Return the CONTIGUOUS header names of 'Base', left to right, stopping at the
-    first empty one.
-
-    Stopping is not cosmetic: the real file has a column M with data but NO
-    header, and a pivot cache refuses to be built over a range with a blank
-    header ("The PivotTable field name is not valid"). Cutting the source range
-    at the last named column is what keeps that from happening.
-    """
+    """CONTIGUOUS header names of 'Base', left to right, stopping at the first empty one: the real file has a data column
+    with NO header, and a pivot cache refuses a range with a blank header."""
     fila = _bloque(ws, fila_encabezado, 1, fila_encabezado, MAX_COLUMNAS_LECTURA)[0]
 
     encabezados = []
@@ -219,12 +129,7 @@ def _encabezados(ws, fila_encabezado):
 
 
 def _indice_columna(encabezados, nombre):
-    """
-    1-based position of a column inside `encabezados`, matched by normalised
-    name. Fails loud with the list of what was actually found: guessing an index
-    here would mean building a pivot over the wrong column, which looks right
-    and adds up wrong.
-    """
+    """1-based position of a column in `encabezados` (normalised name); fails loud: a guessed index builds a pivot over the wrong column."""
     objetivo = norm_texto(nombre)
     for i, encabezado in enumerate(encabezados, start=1):
         if norm_texto(encabezado) == objetivo:
@@ -236,14 +141,7 @@ def _indice_columna(encabezados, nombre):
 
 
 def _ultima_fila(ws, fila_inicio, columnas_piloto):
-    """
-    Last row of 'Base' that actually carries data.
-
-    End(xlUp) from the bottom finds the last USED cell, which overshoots when a
-    cell only carries formatting, so we walk back up while it is empty. Done
-    over three pilot columns keeping the highest, because a blank 'BU' on the
-    last row must not chop the table short.
-    """
+    """Last row of 'Base' with data: walks up from End(xlUp) over three pilot columns, keeping the highest (a blank 'BU' must not chop the table)."""
     mejor = None
     for columna in columnas_piloto:
         fila = ws.Cells(ws.Rows.Count, columna).End(XL_UP).Row
@@ -261,13 +159,7 @@ def _ultima_fila(ws, fila_inicio, columnas_piloto):
 
 
 def _meses_por_anio(ws, fila_inicio, fila_fin, columna_mes):
-    """
-    Read the 'Mes' column once and return {año: [claves de mes, ordenadas]}.
-
-    Keys that do not parse as 'M06-26' (blanks, typos) land under None and are
-    simply never made visible in either pivot; they are reported so nobody has
-    to wonder where an amount went.
-    """
+    """{año: [month keys, sorted]} from the 'Mes' column; keys that do not parse land under None, are never shown in a pivot, and are reported."""
     valores = _bloque(ws, fila_inicio, columna_mes, fila_fin, columna_mes)
 
     por_anio = {}
@@ -285,9 +177,7 @@ def _meses_por_anio(ws, fila_inicio, fila_fin, columna_mes):
     return {anio: sorted(claves) for anio, claves in por_anio.items()}
 
 
-# ----------------------------------------------------------------------
-# Building one PivotTable
-# ----------------------------------------------------------------------
+# --- Building one PivotTable ---
 def _nombres_de_tablas(wb):
     """Every PivotTable name already in the workbook (they must be unique)."""
     nombres = set()
@@ -317,17 +207,8 @@ def _campos(pt):
 
 
 def _filtrar_meses(campo, meses_visibles):
-    """
-    Leave only `meses_visibles` showing on the 'Mes' column field.
-
-    Two rules, both learned the hard way:
-
-      1. Show the wanted items FIRST, hide the rest afterwards. Excel refuses to
-         leave a field with zero visible items, so hiding first can blow up
-         halfway through with a field that is already empty.
-      2. Drive the PivotItem OBJECTS, not their names. `PivotItems("M06-26")`
-         is a name lookup that Excel can misread; the object is unambiguous.
-    """
+    """Leave only `meses_visibles` showing on 'Mes'. Show the wanted items FIRST, hide the rest after (Excel refuses a field
+    with zero visible items), and drive PivotItem OBJECTS, not names (a name lookup can be misread)."""
     items = list(campo.PivotItems())
     visibles = set(meses_visibles)
 
@@ -340,14 +221,8 @@ def _filtrar_meses(campo, meses_visibles):
 
 
 def _crear_tabla(cache, ws, fila, nombre_tabla, campo_fila, meses_visibles):
-    """
-    Create one PivotTable at row `fila`, column A, and return it.
-
-    ManualUpdate is on for the whole build: with it off, Excel recalculates the
-    whole pivot after every single property we touch — one field, one data
-    field, then one redraw per hidden month. On a dozen months that is the
-    difference between a blink and several seconds.
-    """
+    """Create one PivotTable at row `fila`, column A, and return it. ManualUpdate is on for the whole build:
+    otherwise Excel recalculates after every property touched, the difference between a blink and several seconds."""
     destino = f"'{ws.Name}'!R{fila}C1"
     pt = cache.CreatePivotTable(TableDestination=destino, TableName=nombre_tabla)
 
@@ -372,10 +247,7 @@ def _crear_tabla(cache, ws, fila, nombre_tabla, campo_fila, meses_visibles):
 
         _filtrar_meses(c_mes, meses_visibles)
 
-        # 'Mes' is text ('M06-26'), so an A-Z sort of ONE year's keys is also
-        # the chronological order: M01 < M02 < ... < M12. It only works because
-        # each table shows a single year — mixing years would sort M01-25 next
-        # to M01-26.
+        # 'Mes' is text, so an A-Z sort of ONE year's keys is chronological (M01 < ... < M12); mixing years would break it.
         c_mes.AutoSort(XL_ASCENDING, c_mes.Name)
 
         pt.RowGrand    = True   # 'Grand Total' COLUMN on the right  (year per row)
@@ -388,9 +260,7 @@ def _crear_tabla(cache, ws, fila, nombre_tabla, campo_fila, meses_visibles):
             except Exception:
                 pass   # unknown style name in this Excel build — cosmetic only
     finally:
-        # Always hand the pivot back in auto-update mode, even if something
-        # above failed: a workbook saved with ManualUpdate still on opens with a
-        # pivot that refuses to refresh.
+        # Always hand the pivot back in auto-update mode: a workbook saved with ManualUpdate on opens with a pivot that never refreshes.
         pt.ManualUpdate = False
 
     return pt
@@ -408,10 +278,7 @@ def _banner(ws, fila, texto, color, tam=TAM):
 
 
 def _preparar_hoja(wb, nombre):
-    """
-    Drop the sheet if it is already there and create it again in the SAME tab
-    position, so re-running the process does not shuffle the workbook's tabs.
-    """
+    """Drop the sheet if present and recreate it in the SAME tab position, so re-runs do not shuffle the tabs."""
     posicion = None
     for i in range(1, wb.Worksheets.Count + 1):
         if str(wb.Worksheets(i).Name) == nombre:
@@ -430,10 +297,7 @@ def _preparar_hoja(wb, nombre):
 
 def _construir_hoja(wb, cache, nombre_hoja, encabezado_hoja, campo_fila,
                     prefijo_tabla, anios, meses_por_anio, ocupados, update_status):
-    """
-    Build one comparison sheet: heading, then one banner + one pivot per year,
-    stacked top to bottom. Returns (ws, [info de cada tabla], [advertencias]).
-    """
+    """Build one comparison sheet: heading, then one banner + one pivot per year. Returns (ws, [info de cada tabla], [advertencias])."""
     ws = _preparar_hoja(wb, nombre_hoja)
     _banner(ws, FILA_ENCABEZADO_HOJA, encabezado_hoja, AZUL_TITULO, tam=TAM + 1)
 
@@ -445,10 +309,8 @@ def _construir_hoja(wb, cache, nombre_hoja, encabezado_hoja, campo_fila,
         _banner(ws, fila - 1, TITULO_TABLA.format(anio=anio), GRIS_CREACIONES)
 
         if not meses:
-            # No data for that year. Writing the note instead of the pivot is
-            # deliberate: a PivotTable cannot exist with every column hidden, so
-            # the alternative would be either a crash or a table silently
-            # showing the OTHER year's months under this year's banner.
+            # No data for that year: write a note, not a pivot (a pivot cannot have every column hidden, and the
+            # alternative would show the OTHER year's months under this banner).
             aviso = (f"Sin movimientos de {anio} en la pestaña '{HOJA_BASE}' "
                      f"— no hay nada que tabular.")
             ws.Cells(fila, 1).Value = aviso
@@ -470,8 +332,7 @@ def _construir_hoja(wb, cache, nombre_hoja, encabezado_hoja, campo_fila,
         rango = pt.TableRange2
         fila_fin = rango.Row + rango.Rows.Count - 1
 
-        # Bottom-right cell of the pivot = Grand Total of Grand Totals. Cheap
-        # control figure: it has to match the sum of that year's 'Importe'.
+        # Bottom-right cell = Grand Total of Grand Totals: a cheap control figure that must match the year's 'Importe'.
         try:
             total = rango.Cells(rango.Rows.Count, rango.Columns.Count).Value
             total = round(float(total), 2) if total is not None else None
@@ -500,9 +361,7 @@ def _construir_hoja(wb, cache, nombre_hoja, encabezado_hoja, campo_fila,
     return ws, tablas, advertencias
 
 
-# ----------------------------------------------------------------------
-# Main entry point
-# ----------------------------------------------------------------------
+# --- Main entry point ---
 def construir_comparativos(
     ruta_libro,
     ruta_salida=None,
@@ -510,27 +369,10 @@ def construir_comparativos(
     sobrescribir_original=True,
     callback_status=None,
 ):
-    """
-    Build the 'Comparativo BU Mes' and 'Comparativo Agrupador Mes' sheets.
-
-    Args:
-        ruta_libro (str): path to the Reservas workbook. Normally the COPY that
-            construir_variaciones() just wrote in 'Output'.
-        ruta_salida (str|None): only used when sobrescribir_original is False.
-            None -> the 'Output' folder resolved by carpeta_output_desde_input().
-        mes (datetime|str|None): reference month, deciding which year is
-            'current' and which is 'last'. None -> today. A month key ('M07-26')
-            re-runs a past period.
-        sobrescribir_original (bool): default TRUE here, unlike the other two
-            modules, because this one is normally handed the output copy that
-            'Variaciones' just produced — copying a copy would leave the pivots
-            in a second file and the matrices in the first.
-        callback_status (function|None): progress reporting for the GUI.
-
-    Returns:
-        dict: ruta, anio_actual, anio_anterior, fila_encabezado, filas_base,
-              hojas, tablas, meses_por_anio, advertencias.
-    """
+    """Build the 'Comparativo BU Mes' and 'Comparativo Agrupador Mes' sheets in the Reservas workbook (normally the COPY
+    construir_variaciones() just wrote). `mes` decides which year is 'current'. sobrescribir_original defaults to TRUE here,
+    unlike the other modules: copying a copy would split the pivots and the matrices across two files.
+    Returns a dict: ruta, anio_actual, anio_anterior, fila_encabezado, filas_base, hojas, tablas, meses_por_anio, advertencias."""
     def update_status(mensaje):
         if callback_status:
             callback_status(mensaje)
@@ -616,10 +458,8 @@ def construir_comparativos(
             f"{len(meses_por_anio.get(anio_actual, []))} mes(es) con datos"
         )
 
-        # --- One cache, four pivots -----------------------------------
-        # All four tables read the same range, so they share a single
-        # PivotCache: Excel stores the data once instead of four times, and one
-        # 'Actualizar' refreshes the lot.
+        # --- One cache, four pivots ---
+        # All four tables read the same range, so they share one PivotCache: data stored once, one 'Actualizar' refreshes all.
         direccion = (
             f"'{ws_base.Name}'!R{fila_encabezado}C1:R{fila_fin}C{len(encabezados)}"
         )
@@ -658,9 +498,7 @@ def construir_comparativos(
         cerrar_excel(app, wb, pythoncom)
 
 
-# ----------------------------------------------------------------------
-# Standalone run (no GUI, no controller):  python Comparativos.py
-# ----------------------------------------------------------------------
+# --- Standalone run: python Comparativos.py ---
 if __name__ == "__main__":
     print("=== Prueba de tablas dinámicas comparativas (standalone) ===")
     ruta = input("Ruta del archivo de Reservas (.xlsx): ").strip().strip('"')

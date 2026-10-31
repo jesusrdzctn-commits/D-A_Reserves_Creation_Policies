@@ -1,26 +1,7 @@
-"""
-RDA Pólizas D&A — controller.py
-================================
-
-Wires the GUI to the two consolidation modules: confirm, run, summarise in a popup, always
-re-enable the buttons in a `finally`.
-
-Four actions (the GUI shows them as steps 1, 2, 3 and 'Ejecutar pasos 2 y 3'):
-
-    execute_traspaso()       the five templates (tabs 'Reservas Manuales' and
-                             'Reservas Rentas') -> 'Base' of a COPY of archivo 1
-                                                                  (openpyxl)
-    execute_consolidacion()  archivo 1 -> pestaña 'Variaciones' + PivotTables
-    execute_poliza_sap()     archivo 2 -> sección 'PÓLIZA SAP'    (Excel COM)
-                             and then -> 'Póliza Carga Batch'      (Excel COM)
-    execute_todo()           steps 2 and 3, in order, with a combined report
-
-The two processes never share state: different files, different engines,
-different failures. 'Ejecutar todo' just calls them one after the other and
-keeps the score.
-
-The SAP upload will hang off this same class once that half of the process is
-defined.
+"""RDA Pólizas D&A — controller.py: wires the GUI to the consolidation modules (confirm, run,
+summarise in a popup, always re-enable the buttons in a `finally`).
+Actions: execute_traspaso (step 1), execute_consolidacion (2), execute_poliza_sap (3: layout + batch),
+execute_todo (2 and 3 in order). The processes share no state; 'todo' calls them in sequence and keeps score.
 """
 
 import os
@@ -29,7 +10,7 @@ from tkinter import messagebox
 from Comparativos import HOJA_COMPARATIVO_AGRUPADOR, HOJA_COMPARATIVO_BU
 from Consolidacion import GRUPOS, HOJA_VARIACIONES, construir_variaciones, resolver_grupo
 from Create_Poliza_Batch import generar_poliza_batch
-from Create_Poliza_SAP import HOJA_CREACIONES, generar_poliza_sap
+from Create_Poliza_SAP import NOMBRES_HOJAS_LAYOUT, generar_poliza_sap
 from Reservas_Manuales import previsualizar_pegado, traspasar_templates
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
 
@@ -46,38 +27,23 @@ class ReservasController:
         self.gui.on_consolidar = self.execute_consolidacion
         self.gui.on_poliza     = self.execute_poliza_sap
         self.gui.on_todo       = self.execute_todo
-        # The checklist of step 1 lights a channel up from the template FILE NAME
-        # (alphabetical, the way the five files are talked about; not block order).
+        # The step 1 checklist lights a channel from the template FILE NAME (alphabetical order).
         self.gui.configurar_canales(sorted(g["canal"] for g in GRUPOS), self._canal_por_nombre)
 
     @staticmethod
     def _canal_por_nombre(ruta):
-        """
-        Channel a template FILE NAME points at ('ECOMM', 'HD'...), or None. Only a
-        hint for the GUI checklist: the real channel is read from the template's
-        title and validated by the paste.
-        """
+        """Channel a template FILE NAME points at ('ECOMM', 'HD'...), or None; only a hint for the GUI checklist."""
         indice = resolver_grupo(os.path.splitext(os.path.basename(ruta))[0])
         return None if indice is None else GRUPOS[indice]["canal"]
 
-    # =================================================================
-    # Shared runner
-    # =================================================================
+    # --- Shared runner ---
     def _ejecutar(self, funcion):
-        """
-        Run one consolidation and translate its exceptions into (ok, payload).
-
-        Returns (True, resumen) or (False, mensaje_de_error). It does NOT touch
-        the buttons or show popups: the caller decides whether a failure means
-        'stop everything' or 'note it and carry on with step 2'. That is the
-        whole reason this is factored out — 'Ejecutar todo' survives a
-        failed step.
-        """
+        """Run one consolidation -> (True, resumen) | (False, mensaje); touches no buttons or popups, so 'todo' survives a failed step."""
         try:
             return True, funcion()
 
         except (FileNotFoundError, ValueError) as e:
-            # Expected, actionable problems: missing file, missing sheet, missing column, unparseable amount. The message already explains what to fix, so it is passed through as-is.
+            # Expected, actionable problems: the message already says what to fix.
             return False, str(e)
 
         except PermissionError:
@@ -94,21 +60,8 @@ class ReservasController:
             return False, f"Ocurrió un error inesperado:\n\n{e}"
 
     def _ejecutar_poliza(self, ruta_layout, ruta_plantilla):
-        """
-        Process 2 end to end: fill the layout's 'PÓLIZA SAP', then copy it into
-        the 'Póliza Carga Batch' template.
-
-        Returns (True, resumen) when the LAYOUT step worked, (False, mensaje)
-        when it did not. The batch step rides on top of it and reports through
-        two extra keys of the summary, so a batch failure never hides the fact
-        that the layout is already done and saved:
-
-            resumen['batch']        summary of the batch step, or None
-            resumen['batch_error']  message if the batch step failed, or None
-
-        The batch step does not run if the layout step failed: its input would
-        not exist.
-        """
+        """Process 2 end to end: layout 'PÓLIZA SAP', then 'Póliza Carga Batch'. (True, resumen) when the layout worked
+        (resumen['batch'] / ['batch_error'] carry the batch outcome), (False, mensaje) otherwise."""
         ok, resumen = self._ejecutar(lambda: generar_poliza_sap(
             ruta_layout, callback_status=self.gui.set_status,
         ))
@@ -116,9 +69,7 @@ class ReservasController:
             return False, resumen
 
         self.gui.set_status("📦 Llenando la 'Póliza Carga Batch'...")
-        # resumen['ruta'] is the processed copy inside 'Output': that is the file
-        # the batch step reads (not the original), and 'Output' is where the
-        # batch lands too.
+        # resumen['ruta'] is the processed copy in 'Output': the batch reads it and lands there too.
         ok_batch, payload_batch = self._ejecutar(lambda: generar_poliza_batch(
             resumen["ruta"], ruta_plantilla, callback_status=self.gui.set_status,
         ))
@@ -132,18 +83,10 @@ class ReservasController:
         if "completad" not in self.gui.status_var.get():
             self.gui.set_status("✓ Listo para comenzar")
 
-    # =================================================================
-    # PROCESO 1 — pestaña 'Variaciones'
-    # =================================================================
+    # --- PROCESO 1 — pestaña 'Variaciones' ---
     def _revisar_templates(self, ruta_libro, templates, mes):
-        """
-        Dry run of the template paste: read and validate everything, write
-        nothing, and return (ok, texto_para_la_confirmación | mensaje_de_error).
-
-        Called BEFORE the confirmation box so the person sees exactly how many
-        rows will be pasted and — more importantly — how many existing rows of
-        'Base' are about to be replaced. With no templates it is a no-op.
-        """
+        """Dry run of the template paste: validates everything, writes nothing, returns (ok, confirmation text | error).
+        Runs BEFORE the confirmation so the person sees how many rows are pasted and how many 'Base' rows are replaced."""
         if not templates:
             return True, ""
 
@@ -164,9 +107,7 @@ class ReservasController:
         mes        = self.gui.get_mes()
         templates  = self.gui.get_templates()
 
-        # Buttons are off for the whole thing, the review included: reading five
-        # workbooks takes a moment and a second click must not start a second
-        # run on top of it.
+        # Buttons stay off for the whole thing, the review included, so a second click cannot start a second run.
         self.gui.disable_buttons()
         try:
             ok, texto_pegado = self._revisar_templates(ruta_libro, templates, mes)
@@ -193,8 +134,7 @@ class ReservasController:
             ))
             if ok:
                 self.gui.marcar_paso("traspaso", "listo")
-                # The consolidation has to run on the copy that holds the pasted
-                # rows, not on the original: point the file field at it.
+                # The consolidation must run on the copy holding the pasted rows: point the file field at it.
                 self.gui.set_archivo(payload["ruta"])
                 self.gui.set_status("✅ ¡Traspaso completado!")
                 messagebox.showinfo(
@@ -254,9 +194,7 @@ class ReservasController:
         finally:
             self._finalizar()
 
-    # =================================================================
-    # PROCESO 2 — sección 'PÓLIZA SAP'
-    # =================================================================
+    # --- PROCESO 2 — sección 'PÓLIZA SAP' ---
     def execute_poliza_sap(self):
         if not self.gui.validate_poliza():
             return
@@ -268,8 +206,8 @@ class ReservasController:
             "Confirmar póliza SAP",
             f"¿Llenar la sección 'PÓLIZA SAP' y la Póliza Carga Batch?\n\n"
             f"  📄 Layout  : {os.path.basename(ruta_libro)}\n"
-            f"  📑 Pestaña : {HOJA_CREACIONES}\n"
-            f"  ✍️  Columnas: R, T, U, V, W, X, Z\n"
+            f"  📑 Pestañas: {' + '.join(NOMBRES_HOJAS_LAYOUT)}\n"
+            f"  ✍️  Sección : 'PÓLIZA SAP' de cada pestaña\n"
             f"  📦 Plantilla: {os.path.basename(ruta_plantilla)}\n"
             f"     (se llena con los valores de la póliza)\n\n"
             f"Se abrirá Excel en segundo plano y se trabajará sobre COPIAS\n"
@@ -304,9 +242,7 @@ class ReservasController:
         finally:
             self._finalizar()
 
-    # =================================================================
-    # Both, in order
-    # =================================================================
+    # --- Both, in order ---
     def execute_todo(self):
         if not self.gui.validate_todo():
             return
@@ -386,14 +322,10 @@ class ReservasController:
         finally:
             self._finalizar()
 
-    # =================================================================
-    # Summary popups
-    # =================================================================
+    # --- Summary popups ---
     @staticmethod
     def _texto_variaciones(resumen):
-        """
-        Build the 'Variaciones' popup text.
-        """
+        """Build the 'Variaciones' popup text."""
         bloques = "\n".join(
             f"     • {titulo}: {n} concepto(s)"
             for titulo, n in resumen["conceptos_por_bloque"].items()
@@ -446,11 +378,7 @@ class ReservasController:
 
     @staticmethod
     def _texto_confirmacion_pegado(plan):
-        """
-        The template half of the confirmation box: what will be pasted and, in
-        particular, what it will REPLACE. Built from a dry-run plan, so every
-        number here is exactly what the real run will do.
-        """
+        """Template half of the confirmation box: what will be pasted and what it will REPLACE (from a dry-run plan)."""
         lineas = "\n".join(
             f"     • {a['canal']:<11} {len(a['filas']):>4} fila(s)  Σ {a['total']:>16,.2f}"
             f"   [{ReservasController._desglose_hojas(a['hojas'])}]   ({a['nombre']})"
@@ -509,15 +437,8 @@ class ReservasController:
 
     @staticmethod
     def _texto_comparativos(resumen):
-        """
-        Build the PivotTable half of the 'Variaciones' popup.
-
-        Three outcomes, and the popup has to tell them apart: the pivots were
-        built, the pivots were skipped on purpose, or the pivots failed. The
-        third one is NOT an error dialog — the 'Variaciones' sheet is already
-        saved — but it must not be silent either, or somebody opens the file
-        looking for two sheets that are not there.
-        """
+        """PivotTable half of the 'Variaciones' popup: built, skipped on purpose, or failed.
+        A failure is not an error dialog (the sheet is already saved) but must not be silent either."""
         error = resumen.get("comparativos_error")
         if error:
             return (
@@ -560,25 +481,23 @@ class ReservasController:
 
     @staticmethod
     def _texto_poliza(resumen):
-        """
-        Build the 'PÓLIZA SAP' popup text.
-
-        The #N/A warning is the important half. Those rows are going up to SAP:
-        a failed VLOOKUP means an account, a cost centre or a description that
-        the 'catalogo' sheet does not know about, and it has to be fixed BEFORE the upload to SAP.
-        """
+        """Build the 'PÓLIZA SAP' popup text. The #N/A warning is the important half: those rows go up to SAP,
+        so an unknown account, cost centre or description in 'Catalogo' must be fixed BEFORE the upload."""
         columnas = "\n".join(f"     • {c}" for c in resumen["columnas"])
+        hojas = "\n".join(
+            f"     • {h['hoja']}: {h['filas']:,} renglón(es) "
+            f"(filas {h['fila_inicio']}–{h['fila_fin']}), Σ {h['total_control']:,.2f}"
+            for h in resumen["hojas"]
+        )
 
         texto = (
             f"Archivo generado:\n{resumen['ruta']}\n\n"
-            f"  • Pestaña          : {resumen['hoja']}\n"
-            f"  • Filas escritas   : {resumen['filas']:,} "
-            f"(filas {resumen['fila_inicio']}–{resumen['fila_fin']})\n"
+            f"  • Pestañas         :\n{hojas}\n"
+            f"  • Renglones        : {resumen['filas']:,}\n"
             f"  • Columnas         :\n{columnas}\n"
-            f"  • Σ columna {resumen['columna_control']} (MONTO) : "
+            f"  • Σ {resumen['columna_control']} (todas las pestañas) : "
             f"{resumen['total_control']:,.2f}\n"
-            )
-        
+        )
 
         errores = resumen.get("errores") or []
         if errores:
@@ -590,17 +509,22 @@ class ReservasController:
                 celdas = ", ".join(f"{c['celda']} {c['error']}" for c in e["celdas"])
                 resto = e["total"] - len(e["celdas"])
                 texto += (
-                    f"     • {e['columna']} ({e['titulo']}): {e['total']} error(es)\n"
+                    f"     • {e['hoja']} — {e['columna']} ({e['titulo']}): "
+                    f"{e['total']} error(es)\n"
                     f"       {celdas}"
                     + (f", ...y {resto} más" if resto > 0 else "")
                     + "\n"
                 )
             texto += (
                 "\nNormalmente significa que el valor no existe en la pestaña "
-                "'catalogo'."
+                "'Catalogo'."
             )
         else:
             texto += "\n\n✅ Sin errores: todos los VLOOKUP empataron."
+
+        avisos = resumen.get("advertencias") or []
+        if avisos:
+            texto += "\n\nℹ️ Avisos:\n" + "\n".join(f"     • {a}" for a in avisos)
 
         texto += ReservasController._texto_batch(resumen)
 
@@ -608,13 +532,8 @@ class ReservasController:
 
     @staticmethod
     def _texto_batch(resumen):
-        """
-        Build the 'Póliza Carga Batch' half of the 'PÓLIZA SAP' popup.
-
-        Two outcomes: the batch file was produced (with whatever warnings it
-        carries), or it was not — which is NOT an error dialog, because the
-        layout half is already saved, but must not be silent either.
-        """
+        """'Póliza Carga Batch' half of the popup: produced (with its warnings) or not.
+        Not producing it is no error dialog (the layout is already saved) but must not be silent."""
         error = resumen.get("batch_error")
         if error:
             return (
@@ -628,9 +547,11 @@ class ReservasController:
 
         d_ini, d_fin = batch["bloque_debito"]
         c_ini, c_fin = batch["bloque_credito"]
+        origen = " + ".join(f"{h['hoja']} {h['filas']}" for h in batch["hojas_origen"])
         texto = (
             f"\n\n📦 Póliza Carga Batch generada:\n{batch['ruta']}\n\n"
             f"  • Pestaña          : {batch['hoja']}\n"
+            f"  • Origen (Layout)  : {origen}\n"
             f"  • Bloque débito    : filas {d_ini}–{d_fin} ({batch['filas_origen']:,})\n"
             f"  • Bloque crédito   : filas {c_ini}–{c_fin} ({batch['filas_origen']:,})\n"
             f"  • Σ Debit Amount   : {batch['total_debito']:,.2f}\n"

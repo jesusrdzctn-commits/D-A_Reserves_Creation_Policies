@@ -9,7 +9,8 @@ top to bottom, the way the stakeholder runs them every month:
                              'Reservas Manuales' + 'Reservas Rentas') -> 'Base'
                              of a COPY of the Creación de Reservas workbook
     2  Consolidar Variaciones  pestaña 'Variaciones' + tablas dinámicas, on that copy
-    3  Generar Póliza SAP    Layout Creación Reservas (.xlsb) -> sección 'PÓLIZA SAP'
+    3  Generar Póliza SAP    Layout OT (.xlsx, tabs 'Reservas Manuales' + 'Reservas Rentas')
+                             -> sección 'PÓLIZA SAP' of each tab
                              + plantilla 'Póliza Carga Batch' (.xlsx), the file SAP gets
 
 A fourth button runs steps 2 and 3 in sequence.
@@ -22,7 +23,7 @@ bottom says what is happening. Colour carries meaning (green done, amber
 attention, red error), never decoration.
 
 Each step owns its pickers and its button because they are separate inputs with
-separate failures: if the .xlsb is open in Excel, step 2 must still work.
+separate failures: if the layout is open in Excel, step 2 must still work.
 
 No SAP, no pandas and no Excel imports here on purpose: this file can be opened
 and clicked through on any machine with `python interfaz_GUI.py`. The controller
@@ -38,11 +39,11 @@ from tkinter import filedialog, messagebox
 
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
 
-# Which extensions each picker offers. The WHSL layout is .xlsb (binary
-# workbook), so it needs its own filter — it would not show up under '*.xlsx'.
+# Which extensions each picker offers. The OT layout is a plain .xlsx, like the
+# rest of the files (the old WHSL layout was a binary .xlsb).
 FILTRO_VARIACIONES = [("Libros de Excel", "*.xlsx *.xlsm"),
                       ("Todos los archivos", "*.*")]
-FILTRO_POLIZA      = [("Libros de Excel", "*.xlsb *.xlsx *.xlsm"),
+FILTRO_POLIZA      = [("Libros de Excel", "*.xlsx *.xlsm"),
                       ("Todos los archivos", "*.*")]
 # The 'Póliza Carga Batch' template is a plain .xlsx (the file SAP receives).
 FILTRO_BATCH       = [("Libros de Excel", "*.xlsx *.xlsm"),
@@ -316,18 +317,18 @@ class ReservasGUI:
         escala = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
         pantalla_w, pantalla_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         ancho = min(int(1040 * escala), pantalla_w - 40)
-        alto = min(int(700 * escala), pantalla_h - 90)
+        alto = min(int(640 * escala), pantalla_h - 90)
         x = max(0, (pantalla_w - ancho) // 2)
         y = max(0, (pantalla_h - alto) // 3)
         self.root.geometry(f"{ancho}x{alto}+{x}+{y}")
-        self.root.minsize(min(int(980 * escala), ancho), min(int(660 * escala), alto))
+        self.root.minsize(min(int(980 * escala), ancho), min(int(600 * escala), alto))
 
     def _ajustar_al_contenido(self):
-        """Grow the window to what the layout really needs (fonts and DPI change it), within the screen."""
+        """Fit the window to what the layout really needs (fonts and DPI change it), within the screen."""
         self.root.update_idletasks()
         pantalla_w, pantalla_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         ancho = min(max(self.root.winfo_width(), self.root.winfo_reqwidth()), pantalla_w - 20)
-        alto = min(max(self.root.winfo_height(), self.root.winfo_reqheight()), pantalla_h - 60)
+        alto = min(self.root.winfo_reqheight(), pantalla_h - 60)
         x = max(0, (pantalla_w - ancho) // 2)
         y = max(0, (pantalla_h - alto) // 3)
         self.root.geometry(f"{ancho}x{alto}+{x}+{y}")
@@ -569,11 +570,12 @@ class ReservasGUI:
     def _build_tarjeta_poliza(self, parent):
         marco, interior = self._tarjeta(
             parent, "poliza",
-            "Llena 'PÓLIZA SAP' en el Layout y de ahí la plantilla 'Póliza Carga Batch', "
-            "el archivo que se sube a SAP. No usa el periodo.",
+            "Llena 'PÓLIZA SAP' en las pestañas 'Reservas Manuales' y 'Reservas Rentas' "
+            "del Layout OT y de ahí la plantilla 'Póliza Carga Batch', el archivo que se "
+            "sube a SAP. No usa el periodo.",
         )
         self._fila_archivo(interior, self.archivo_poliza_var, self._elegir_archivo_poliza,
-                           etiqueta="Layout (.xlsb)")
+                           etiqueta="Layout OT (.xlsx)")
         tk.Frame(interior, bg=Paleta.tarjeta, height=6).pack()
         self._fila_archivo(interior, self.archivo_batch_var, self._elegir_plantilla_batch,
                            etiqueta="Carga Batch (.xlsx)")
@@ -724,7 +726,7 @@ class ReservasGUI:
     def _elegir_archivo_poliza(self):
         self._elegir(
             self.archivo_poliza_var,
-            "Selecciona el Layout Creación Reservas",
+            "Selecciona el Layout OT (Reservas Manuales / Reservas Rentas)",
             FILTRO_POLIZA,
         )
 
@@ -970,8 +972,8 @@ class ReservasGUI:
 
     def validate_poliza(self):
         if not self._validar_ruta(
-            self.get_archivo_poliza(), "Layout Creación Reservas",
-            {".xlsb", ".xlsx", ".xlsm"}
+            self.get_archivo_poliza(), "Layout OT",
+            {".xlsx", ".xlsm"}
         ):
             return False
         # Step 3 ends by filling the batch template, so it is mandatory.
