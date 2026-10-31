@@ -15,6 +15,7 @@ ARCHIVOS_REQUERIDOS = [
     "controller.py",
     "Consolidacion.py",
     "Comparativos.py",
+    "Reservas_Manuales.py",
     "Create_Poliza_SAP.py",
     "Create_Poliza_Batch.py",
     "utils.py",
@@ -84,6 +85,13 @@ def create_executable():
         # Consolidacion.py importa Comparativos DENTRO de la función, por la
         # misma razón. Se declara por si el análisis de PyInstaller no lo ve.
         "--hidden-import=Comparativos",
+
+        # Consolidacion.py también importa Reservas_Manuales DENTRO de la
+        # función (el módulo importa a Consolidacion, así que un import al
+        # inicio sería circular). El controller sí lo importa arriba, pero se
+        # declara aquí para no depender de eso.
+        "--hidden-import=Reservas_Manuales",
+        "--hidden-import=openpyxl.formula.translate",
 
         # Punto de entrada
         "main.py",

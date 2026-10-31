@@ -13,10 +13,11 @@ Fecha: 2026
 import tkinter as tk
 
 from controller import ReservasController
-from interfaz_GUI import ReservasGUI
+from interfaz_GUI import ReservasGUI, activar_dpi_alto
 
 
 def main():
+    activar_dpi_alto()   # before tk.Tk(): sharp text on high-DPI screens
     root = tk.Tk()
     gui = ReservasGUI(root)
     ReservasController(gui)   # plugs the GUI callbacks in

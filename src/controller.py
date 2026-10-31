@@ -5,12 +5,15 @@ RDA Pólizas D&A — controller.py
 Wires the GUI to the two consolidation modules: confirm, run, summarise in a popup, always
 re-enable the buttons in a `finally`.
 
-Three actions:
+Four actions (the GUI shows them as steps 1, 2, 3 and 'Ejecutar pasos 2 y 3'):
 
-    execute_consolidacion()  archivo 1 -> pestaña 'Variaciones'   (openpyxl)
+    execute_traspaso()       the five templates (tabs 'Reservas Manuales' and
+                             'Reservas Rentas') -> 'Base' of a COPY of archivo 1
+                                                                  (openpyxl)
+    execute_consolidacion()  archivo 1 -> pestaña 'Variaciones' + PivotTables
     execute_poliza_sap()     archivo 2 -> sección 'PÓLIZA SAP'    (Excel COM)
                              and then -> 'Póliza Carga Batch'      (Excel COM)
-    execute_todo()           both, in order, with a combined report
+    execute_todo()           steps 2 and 3, in order, with a combined report
 
 The two processes never share state: different files, different engines,
 different failures. 'Ejecutar todo' just calls them one after the other and
@@ -24,9 +27,10 @@ import os
 from tkinter import messagebox
 
 from Comparativos import HOJA_COMPARATIVO_AGRUPADOR, HOJA_COMPARATIVO_BU
-from Consolidacion import HOJA_VARIACIONES, construir_variaciones
+from Consolidacion import GRUPOS, HOJA_VARIACIONES, construir_variaciones, resolver_grupo
 from Create_Poliza_Batch import generar_poliza_batch
 from Create_Poliza_SAP import HOJA_CREACIONES, generar_poliza_sap
+from Reservas_Manuales import previsualizar_pegado, traspasar_templates
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
 
 # How many unmatched concepts to list inside the popup before trimming, so the message box never grows taller than the screen.
@@ -38,9 +42,23 @@ class ReservasController:
 
     def __init__(self, gui):
         self.gui = gui
+        self.gui.on_traspasar  = self.execute_traspaso
         self.gui.on_consolidar = self.execute_consolidacion
         self.gui.on_poliza     = self.execute_poliza_sap
         self.gui.on_todo       = self.execute_todo
+        # The checklist of step 1 lights a channel up from the template FILE NAME
+        # (alphabetical, the way the five files are talked about; not block order).
+        self.gui.configurar_canales(sorted(g["canal"] for g in GRUPOS), self._canal_por_nombre)
+
+    @staticmethod
+    def _canal_por_nombre(ruta):
+        """
+        Channel a template FILE NAME points at ('ECOMM', 'HD'...), or None. Only a
+        hint for the GUI checklist: the real channel is read from the template's
+        title and validated by the paste.
+        """
+        indice = resolver_grupo(os.path.splitext(os.path.basename(ruta))[0])
+        return None if indice is None else GRUPOS[indice]["canal"]
 
     # =================================================================
     # Shared runner
@@ -117,6 +135,82 @@ class ReservasController:
     # =================================================================
     # PROCESO 1 — pestaña 'Variaciones'
     # =================================================================
+    def _revisar_templates(self, ruta_libro, templates, mes):
+        """
+        Dry run of the template paste: read and validate everything, write
+        nothing, and return (ok, texto_para_la_confirmación | mensaje_de_error).
+
+        Called BEFORE the confirmation box so the person sees exactly how many
+        rows will be pasted and — more importantly — how many existing rows of
+        'Base' are about to be replaced. With no templates it is a no-op.
+        """
+        if not templates:
+            return True, ""
+
+        self.gui.set_status("🔎 Revisando los templates de Reservas Manuales...")
+        ok, plan = self._ejecutar(
+            lambda: previsualizar_pegado(ruta_libro, templates, mes)
+        )
+        if not ok:
+            return False, plan
+        return True, self._texto_confirmacion_pegado(plan)
+
+    def execute_traspaso(self):
+        """Paste the templates into 'Base' of a copy; the pivots are NOT built here."""
+        if not self.gui.validate_traspaso():
+            return
+
+        ruta_libro = self.gui.get_archivo()
+        mes        = self.gui.get_mes()
+        templates  = self.gui.get_templates()
+
+        # Buttons are off for the whole thing, the review included: reading five
+        # workbooks takes a moment and a second click must not start a second
+        # run on top of it.
+        self.gui.disable_buttons()
+        try:
+            ok, texto_pegado = self._revisar_templates(ruta_libro, templates, mes)
+            if not ok:
+                self.gui.marcar_paso("traspaso", "error")
+                self.gui.set_status("❌ Los templates no pasaron la validación")
+                messagebox.showerror("No se puede traspasar", texto_pegado)
+                return
+
+            confirm = messagebox.askyesno(
+                "Confirmar traspaso",
+                f"¿Traspasar los templates a 'Base'?\n\n"
+                f"  📄 Archivo : {os.path.basename(ruta_libro)}\n"
+                f"{texto_pegado}\n"
+                f"Se trabajará sobre una COPIA en la subcarpeta 'Output',\n"
+                f"así que el archivo original no se toca."
+            )
+            if not confirm:
+                return
+
+            self.gui.marcar_paso("traspaso", "en_curso")
+            ok, payload = self._ejecutar(lambda: traspasar_templates(
+                ruta_libro, templates, mes=mes, callback_status=self.gui.set_status,
+            ))
+            if ok:
+                self.gui.marcar_paso("traspaso", "listo")
+                # The consolidation has to run on the copy that holds the pasted
+                # rows, not on the original: point the file field at it.
+                self.gui.set_archivo(payload["ruta"])
+                self.gui.set_status("✅ ¡Traspaso completado!")
+                messagebox.showinfo(
+                    "Traspaso completado",
+                    f"Archivo generado:\n{payload['ruta']}"
+                    f"{self._texto_pegado(payload)}\n\n"
+                    f"ℹ️ El campo del archivo ahora apunta a esta copia: el botón\n"
+                    f"'Consolidar Variaciones' trabajará sobre ella.",
+                )
+            else:
+                self.gui.marcar_paso("traspaso", "error")
+                self.gui.set_status("❌ Error en el traspaso")
+                messagebox.showerror("Error en el traspaso", payload)
+        finally:
+            self._finalizar()
+
     def execute_consolidacion(self):
         if not self.gui.validate_variaciones():
             return
@@ -142,16 +236,19 @@ class ReservasController:
 
         self.gui.disable_buttons()
         try:
+            self.gui.marcar_paso("consolidacion", "en_curso")
             ok, payload = self._ejecutar(lambda: construir_variaciones(
                 ruta_libro, mes=mes, callback_status=self.gui.set_status,
             ))
             if ok:
+                self.gui.marcar_paso("consolidacion", "listo")
                 self.gui.set_status("✅ ¡Consolidación completada!")
                 messagebox.showinfo(
                     "Consolidación completada",
                     self._texto_variaciones(payload),
                 )
             else:
+                self.gui.marcar_paso("consolidacion", "error")
                 self.gui.set_status("❌ Error en la consolidación")
                 messagebox.showerror("Error en la consolidación", payload)
         finally:
@@ -183,14 +280,17 @@ class ReservasController:
 
         self.gui.disable_buttons()
         try:
+            self.gui.marcar_paso("poliza", "en_curso")
             ok, payload = self._ejecutar_poliza(ruta_libro, ruta_plantilla)
             if ok and not payload["batch_error"]:
+                self.gui.marcar_paso("poliza", "listo")
                 self.gui.set_status("✅ ¡Póliza SAP completada!")
                 messagebox.showinfo(
                     "Póliza SAP completada", self._texto_poliza(payload)
                 )
             elif ok:
                 # Layout done and saved; only the batch step failed.
+                self.gui.marcar_paso("poliza", "parcial")
                 self.gui.set_status(
                     "⚠️ Póliza SAP completada, pero la Póliza Carga Batch falló"
                 )
@@ -198,6 +298,7 @@ class ReservasController:
                     "Póliza SAP completada a medias", self._texto_poliza(payload)
                 )
             else:
+                self.gui.marcar_paso("poliza", "error")
                 self.gui.set_status("❌ Error generando la póliza SAP")
                 messagebox.showerror("Error generando la póliza SAP", payload)
         finally:
@@ -216,54 +317,59 @@ class ReservasController:
         mes      = self.gui.get_mes()
         anterior, actual = claves_mes_actual_y_anterior(mes)
 
-        confirm = messagebox.askyesno(
-            "Confirmar ejecución completa",
-            f"¿Correr los DOS procesos?\n\n"
-            f"  1️⃣  '{HOJA_VARIACIONES}'\n"
-            f"      📄 {os.path.basename(ruta_var)}\n"
-            f"      📅 {anterior} vs {actual}\n\n"
-            f"  2️⃣  'PÓLIZA SAP' + Póliza Carga Batch\n"
-            f"      📄 {os.path.basename(ruta_pol)}\n"
-            f"      📦 {os.path.basename(ruta_bat)}\n\n"
-            f"Ambos escriben sobre COPIAS en la subcarpeta 'Output'."
-        )
-        if not confirm:
-            return
-
         self.gui.disable_buttons()
         try:
-            # --- Step 1 ---------------------------------------------------
-            self.gui.set_status("1️⃣  Consolidando 'Variaciones'...")
+            confirm = messagebox.askyesno(
+                "Confirmar ejecución completa",
+                f"¿Correr los pasos 2 y 3?\n\n"
+                f"  2️⃣  '{HOJA_VARIACIONES}'\n"
+                f"      📄 {os.path.basename(ruta_var)}\n"
+                f"      📅 {anterior} vs {actual}\n\n"
+                f"  3️⃣  'PÓLIZA SAP' + Póliza Carga Batch\n"
+                f"      📄 {os.path.basename(ruta_pol)}\n"
+                f"      📦 {os.path.basename(ruta_bat)}\n\n"
+                f"Ambos escriben sobre COPIAS en la subcarpeta 'Output'."
+            )
+            if not confirm:
+                return
+
+            # --- Step 2 ---------------------------------------------------
+            self.gui.marcar_paso("consolidacion", "en_curso")
+            self.gui.set_status("2️⃣  Consolidando 'Variaciones'...")
             ok1, payload1 = self._ejecutar(lambda: construir_variaciones(
                 ruta_var, mes=mes, callback_status=self.gui.set_status,
             ))
+            self.gui.marcar_paso("consolidacion", "listo" if ok1 else "error")
 
             if not ok1:
                 seguir = messagebox.askyesno(
-                    "Falló el paso 1",
+                    "Falló el paso 2",
                     f"La consolidación de '{HOJA_VARIACIONES}' falló:\n\n"
                     f"{payload1}\n\n"
-                    f"¿Continúo con el paso 2 ('PÓLIZA SAP')?",
+                    f"¿Continúo con el paso 3 ('PÓLIZA SAP')?",
                 )
                 if not seguir:
-                    self.gui.set_status("❌ Ejecución detenida en el paso 1")
+                    self.gui.set_status("❌ Ejecución detenida en el paso 2")
                     return
 
-            # --- Step 2 ---------------------------------------------------
-            self.gui.set_status("2️⃣  Generando la 'PÓLIZA SAP'...")
+            # --- Step 3 ---------------------------------------------------
+            self.gui.marcar_paso("poliza", "en_curso")
+            self.gui.set_status("3️⃣  Generando la 'PÓLIZA SAP'...")
             ok2, payload2 = self._ejecutar_poliza(ruta_pol, ruta_bat)
-            # Step 2 counts as fully OK only if the batch file was also produced.
+            # Step 3 counts as fully OK only if the batch file was also produced.
             batch_fallo = ok2 and bool(payload2["batch_error"])
+            self.gui.marcar_paso(
+                "poliza", "error" if not ok2 else ("parcial" if batch_fallo else "listo"))
 
             # --- Combined report ------------------------------------------
             partes = []
             partes.append(
-                f"1️⃣  {HOJA_VARIACIONES}  —  {'✅ OK' if ok1 else '❌ FALLÓ'}\n"
+                f"2️⃣  {HOJA_VARIACIONES}  —  {'✅ OK' if ok1 else '❌ FALLÓ'}\n"
                 + (self._texto_variaciones(payload1) if ok1 else payload1)
             )
             estado2 = "❌ FALLÓ" if not ok2 else ("⚠️ A MEDIAS" if batch_fallo else "✅ OK")
             partes.append(
-                f"2️⃣  PÓLIZA SAP + Póliza Carga Batch  —  {estado2}\n"
+                f"3️⃣  PÓLIZA SAP + Póliza Carga Batch  —  {estado2}\n"
                 + (self._texto_poliza(payload2) if ok2 else payload2)
             )
             texto = ("\n" + "─" * 48 + "\n").join(partes)
@@ -303,6 +409,7 @@ class ReservasController:
             f"  • Σ {resumen['mes_actual']}        : {resumen['total_actual']:,.2f}"
         )
 
+        texto += ReservasController._texto_pegado(resumen.get("pegado"))
         texto += ReservasController._texto_comparativos(resumen)
 
         no_mapeados = resumen.get("conceptos_no_mapeados") or []
@@ -318,14 +425,86 @@ class ReservasController:
                 + (f"\n     • ...y {resto} más" if resto > 0 else "")
             )
 
-        sin_bloque = resumen.get("analistas_sin_bloque") or []
+        sin_bloque = resumen.get("canales_sin_bloque") or []
         if sin_bloque:
+            mostrados = sin_bloque[:MAX_NO_MAPEADOS_EN_POPUP]
+            resto = len(sin_bloque) - len(mostrados)
             texto += (
-                f"\n\n⚠️ Analista(s) en la Base sin matriz asignada: "
-                f"{', '.join(sin_bloque)}.\n"
-                f"Sus importes NO aparecen en ninguna matriz."
+                f"\n\n⚠️ Canal(es) de la Base sin matriz asignada "
+                f"({resumen['mes_anterior']} y {resumen['mes_actual']}):\n"
+                + "\n".join(f"     • {c}" for c in mostrados)
+                + (f"\n     • ...y {resto} más" if resto > 0 else "")
+                + "\nSus importes NO aparecen en ninguna matriz."
             )
 
+        return texto
+
+    @staticmethod
+    def _desglose_hojas(hojas):
+        """'Manuales 2 + Rentas 1': rows taken from each tab of a template."""
+        return " + ".join(f"{h['etiqueta']} {h['filas']}" for h in hojas)
+
+    @staticmethod
+    def _texto_confirmacion_pegado(plan):
+        """
+        The template half of the confirmation box: what will be pasted and, in
+        particular, what it will REPLACE. Built from a dry-run plan, so every
+        number here is exactly what the real run will do.
+        """
+        lineas = "\n".join(
+            f"     • {a['canal']:<11} {len(a['filas']):>4} fila(s)  Σ {a['total']:>16,.2f}"
+            f"   [{ReservasController._desglose_hojas(a['hojas'])}]   ({a['nombre']})"
+            for a in plan["archivos"]
+        )
+        texto = (
+            f"\n  📥 Se pegarán en 'Base' ({plan['mes']}):\n{lineas}\n"
+            f"     Total: {len(plan['filas_nuevas']):,} fila(s)  Σ {plan['total_nuevo']:,.2f}\n"
+        )
+
+        if plan["filas_a_reemplazar"]:
+            por_canal = ", ".join(
+                f"{canal} {n}" for canal, n in plan["reemplazo_por_canal"].items() if n
+            )
+            texto += (
+                f"\n  ♻️  Se REEMPLAZARÁN {len(plan['filas_a_reemplazar']):,} fila(s) que ya "
+                f"están en 'Base'\n"
+                f"     para {plan['mes']} y esos mismos canales (Σ {plan['total_reemplazado']:,.2f}):\n"
+                f"     {por_canal}\n"
+            )
+        else:
+            texto += (
+                f"\n  ✅ 'Base' todavía no tiene {plan['mes']} de estos canales: "
+                f"no se reemplaza nada.\n"
+            )
+
+        for aviso in plan["advertencias"]:
+            texto += f"  ⚠️ {aviso}\n"
+        return texto
+
+    @staticmethod
+    def _texto_pegado(pegado):
+        """The 'templates pasted' section of the result popup ('' if none)."""
+        if not pegado:
+            return ""
+
+        lineas = "\n".join(
+            f"     • {a['canal']}: {a['filas']:,} fila(s), Σ {a['total']:,.2f}"
+            f"   [{ReservasController._desglose_hojas(a['hojas'])}]"
+            for a in pegado["archivos"]
+        )
+        texto = (
+            f"\n\n📥 Templates pegados en 'Base' ({pegado['mes']}):\n{lineas}\n"
+            f"  • Filas pegadas     : {pegado['filas_pegadas']:,} "
+            f"(filas {pegado['fila_inicio']}–{pegado['fila_fin']}), "
+            f"Σ {pegado['total_pegado']:,.2f}\n"
+            f"  • Filas reemplazadas: {pegado['filas_reemplazadas']:,}"
+        )
+        if pegado["filas_reemplazadas"]:
+            texto += f" (Σ {pegado['total_reemplazado']:,.2f})"
+        if pegado.get("verificado"):
+            texto += "\n  ✅ Verificado: lo pegado coincide con los templates, celda por celda."
+        for aviso in pegado["advertencias"]:
+            texto += f"\n  ⚠️ {aviso}"
         return texto
 
     @staticmethod

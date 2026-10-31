@@ -5,15 +5,21 @@ RDA Pólizas D&A — Consolidación
 Builds the 'Variaciones' sheet of '07 Archivo Creacion de Reservas PMF OT.xlsx'
 out of the 'Base' sheet.
 
+Optionally, BEFORE building it, the five 'RESERVAS MANUALES <CANAL>' templates
+are pasted into 'Base' (see Reservas_Manuales.py). The paste is planned and
+applied in memory first, so the matrices already see the new rows.
+
 This is the mirror image of the Validación Factura Global flow: there we
 downloaded from SAP and then consolidated; here we consolidate first and the
 upload to SAP comes afterwards.
+
+The five blocks are grouped by CHANNEL (the 'CT' column of 'Base'), no longer by analyst.
 
 What the sheet looks like (one block per group, stacked vertically, one blank
 row between blocks):
 
     A1   Creaciones 2026                      <- grey banner
-    A2   Regionales David                     <- light blue title (group + analyst)
+    A2   Smkt Regionales                      <- light blue title (group)
     A3   Concepto | M06-26 |   | M07-26 | % | B/W | % VS M06-26 | INDEX
     A4   <agrupador>   1,000.00      500.00  ...
     ...
@@ -72,7 +78,12 @@ HOJA_VARIACIONES = "Variaciones"
 COL_MES       = "Mes"
 COL_AGRUPADOR = "Agrupador"
 COL_IMPORTE   = "Importe"
-COL_ANALISTA  = "Solicitante / KAM Resp"
+# Channel of each row = the column the five blocks are grouped by. It is 'CT', not
+# 'Canal Venta': 'CT' carries ECOMM / HD / NACIONALES / PROXIMITY / REGIONALES,
+# while 'Canal Venta' keeps whatever the template's CANAL cell said.
+COL_CANAL     = "CT"
+# Read only to notice rows of an OLDER paste (channel in 'Canal Venta', 'CT' blank).
+COL_CANAL_VENTA = "Canal Venta"
 
 # The header row of 'Base' is not row 1 (there are empty rows plus a
 # 'Seleccionar / Escritura / Formula' hint row above it), so it is detected by
@@ -83,21 +94,22 @@ FILA_ENCABEZADO_BASE_DEFAULT = 7
 # ----------------------------------------------------------------------
 # The five blocks
 # ----------------------------------------------------------------------
-# PENDING: the real rule that maps an analyst to a group is still with the
-# stakeholder. This list is the whole configuration point — when the rule
-# arrives, only this constant changes.
+# The blocks are grouped by CHANNEL ('CT' of 'Base'), which is also the
+# title of each of the five 'RESERVAS MANUALES <CANAL>' templates. This list is
+# the whole configuration point for the grouping.
 #
-#   titulo            : text of the block title.
-#   analistas         : values of 'Solicitante / KAM Resp' that feed the block.
-#   mostrar_analista  : True appends the analyst name to the title
-#                       ('Regionales' + 'DAVID' -> 'Regionales David').
-#                       False leaves the title alone ('ECOMMERCE', 'HD KAREN').
+#   titulo   : text of the block title in 'Variaciones'.
+#   canal    : the name written into 'CT' when a template is pasted.
+#   canales  : every spelling of that channel that counts as belonging to the
+#              block. Matched by words, accent- and case-insensitive and
+#              plural-insensitive (see resolver_grupo), so 'SMKT NACIONALES'
+#              and 'Nacional' both land in the 'NACIONALES' block.
 GRUPOS = [
-    {"titulo": "Smkt Regionales", "analistas": ["DAVID"],  "mostrar_analista": True},
-    {"titulo": "Proximity",       "analistas": ["JIMENA"], "mostrar_analista": True},
-    {"titulo": "Smkt Nacionales", "analistas": ["CARLOS"], "mostrar_analista": True},
-    {"titulo": "ECOMMERCE",       "analistas": ["PABLO"],  "mostrar_analista": False},
-    {"titulo": "HD",              "analistas": ["KAREN"],  "mostrar_analista": False},
+    {"titulo": "Smkt Regionales", "canal": "REGIONALES", "canales": ["REGIONALES"]},
+    {"titulo": "Proximity",       "canal": "PROXIMITY",  "canales": ["PROXIMITY"]},
+    {"titulo": "Smkt Nacionales", "canal": "NACIONALES", "canales": ["NACIONALES"]},
+    {"titulo": "ECOMMERCE",       "canal": "ECOMM",      "canales": ["ECOMM", "ECOMMERCE", "E-COMMERCE"]},
+    {"titulo": "HD",              "canal": "HD",         "canales": ["HD"]},
 ]
 
 
@@ -214,9 +226,24 @@ def _relleno(rgb):
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+def _es_nulo(valor):
+    """
+    True for None AND for the missing-value markers pandas puts in a column
+    (NaN / NA). Newer pandas turns every empty cell of a text column into NaN,
+    and str(NaN) is the text 'nan': without this check an empty 'Mes' or
+    'Agrupador' would turn into a real-looking value and slip past the filters.
+    """
+    if valor is None:
+        return True
+    try:
+        return bool(pd.isna(valor))
+    except (TypeError, ValueError):
+        return False   # not a scalar (cannot happen for a cell value)
+
+
 def _normalizar(texto):
-    """Trim and upper-case, tolerating None. Used to match headers and values."""
-    return str(texto).strip().upper() if texto is not None else ""
+    """Trim and upper-case, tolerating None/NaN. Used to match headers and values."""
+    return "" if _es_nulo(texto) else str(texto).strip().upper()
 
 
 def _parse_importe(valor):
@@ -229,7 +256,7 @@ def _parse_importe(valor):
     token that is still not numeric raises, so a corrupt amount stops the run
     instead of quietly understating a block total.
     """
-    if valor is None:
+    if _es_nulo(valor):
         return 0.0
     if isinstance(valor, (int, float)) and not isinstance(valor, bool):
         return float(valor)
@@ -431,15 +458,76 @@ def construir_mapeo_conceptos(agrupadores, catalogo=None, umbral=None):
 
 
 # ----------------------------------------------------------------------
+# Matching 'CT' (channel) -> block
+# ----------------------------------------------------------------------
+def resolver_grupo(valor, grupos=None):
+    """
+    Return the index (into `grupos`) of the block a channel label belongs to, or
+    None when it belongs to no block or to more than one.
+
+    Same word-level rule as the concept matching: every meaningful word of one
+    of the block's spellings must be present in the label, ignoring accents,
+    case, punctuation, plurals and filler words. That lets one function read all
+    of these:
+
+        'HD'                                        -> HD
+        'smkt nacionales'                           -> Smkt Nacionales
+        'LAYOUT CREACION DE RESERVAS D&A ECOMM'     -> ECOMMERCE   (a template title)
+        'RESERVAS MANUALES REGIONALES OCT 26.xlsx'  -> Smkt Regionales (a file name)
+
+    A label that matches TWO blocks ('HD NACIONALES') is ambiguous and returns
+    None on purpose: guessing would move money between matrices silently, while
+    None gets reported as an unassigned channel.
+    """
+    grupos = grupos if grupos is not None else GRUPOS
+    tokens = _tokens_significativos(valor)
+    if not tokens:
+        return None
+
+    aciertos = [
+        i for i, grupo in enumerate(grupos)
+        if any(
+            (alias_tokens := _tokens_significativos(alias))
+            and alias_tokens <= tokens
+            for alias in grupo["canales"]
+        )
+    ]
+    return aciertos[0] if len(aciertos) == 1 else None
+
+
+def asignar_grupos(df, grupos=None):
+    """
+    Add the '_grupo' column to `df`: index of the block each row's '_canal'
+    belongs to, or -1 when it belongs to none.
+
+    Each DISTINCT channel is resolved once, not once per row.
+    """
+    grupos = grupos if grupos is not None else GRUPOS
+    resueltos = {c: resolver_grupo(c, grupos) for c in df["_canal"].unique()}
+
+    df = df.copy()
+    df["_grupo"] = df["_canal"].map(
+        lambda c: -1 if resueltos[c] is None else resueltos[c]
+    )
+    return df
+
+
+# ----------------------------------------------------------------------
 # Reading 'Base'
 # ----------------------------------------------------------------------
 def leer_base(ruta_libro):
     """
-    Read the 'Base' sheet into a tidy DataFrame with four working columns:
-    '_mes', '_agrupador', '_importe', '_analista'.
+    Read the 'Base' sheet into a tidy DataFrame with six working columns:
+    '_nfila' (the sheet row the data came from), '_mes', '_agrupador',
+    '_importe', '_canal' (the 'CT' column) and '_canal_venta' ('Canal Venta',
+    '' when the sheet has no such column).
 
     Returns:
-        (df, fila_encabezado)
+        (df, fila_encabezado, ultima_fila)
+
+        `ultima_fila` is the last sheet row holding ANY value (header row if the
+        sheet has no data). Reservas_Manuales uses it to know where to paste and
+        to refuse to paste under a footer or a totals row.
     """
     if not os.path.exists(ruta_libro):
         raise FileNotFoundError(f"Archivo no encontrado: {ruta_libro}")
@@ -468,23 +556,40 @@ def leer_base(ruta_libro):
         str(h) if h is not None else f"_sin_nombre_{i}"
         for i, h in enumerate(filas[0])
     ]
+    # Last row holding any value, found BEFORE any filtering, from the raw rows.
+    ultima_fila = fila_encabezado
+    for desplazamiento in range(len(filas) - 1, 0, -1):
+        if any(v is not None and str(v).strip() != "" for v in filas[desplazamiento]):
+            ultima_fila = fila_encabezado + desplazamiento
+            break
+
     df = pd.DataFrame(filas[1:], columns=encabezados)
     df = df.dropna(how="all")
+    # dropna keeps the original 0..n-1 index labels, so the label maps straight
+    # back to the sheet row. Named '_nfila' because '_fila' is already the row
+    # LABEL of the matrices inside calcular_matrices().
+    df["_nfila"] = df.index + fila_encabezado + 1
 
     c_mes  = _resolver_columna(df, COL_MES)
     c_agr  = _resolver_columna(df, COL_AGRUPADOR)
     c_imp  = _resolver_columna(df, COL_IMPORTE)
-    c_ana  = _resolver_columna(df, COL_ANALISTA)
+    c_can  = _resolver_columna(df, COL_CANAL)
 
     df["_mes"]        = df[c_mes].map(_normalizar)
-    df["_agrupador"]  = df[c_agr].map(lambda v: str(v).strip() if v is not None else "")
+    df["_agrupador"]  = df[c_agr].map(lambda v: "" if _es_nulo(v) else str(v).strip())
     df["_importe"]    = df[c_imp].map(_parse_importe)
-    df["_analista"]   = df[c_ana].map(_normalizar)
+    df["_canal"]      = df[c_can].map(_normalizar)
+    # Not used for grouping any more: only so the paste can spot rows of an older
+    # paste (channel in 'Canal Venta', 'CT' still blank) before it doubles them.
+    try:
+        df["_canal_venta"] = df[_resolver_columna(df, COL_CANAL_VENTA)].map(_normalizar)
+    except ValueError:
+        df["_canal_venta"] = ""
 
     # Rows with no month or no concept cannot land in any matrix.
     df = df[(df["_mes"] != "") & (df["_agrupador"] != "")]
 
-    return df, fila_encabezado
+    return df, fila_encabezado, ultima_fila
 
 
 # ----------------------------------------------------------------------
@@ -497,7 +602,7 @@ def calcular_matrices(df, clave_anterior, clave_actual, grupos=None,
 
     Every 'Agrupador' is first matched to a catalogue concept (once for the whole
     file, so the five blocks always agree). Then, per group: keep only its
-    analysts and the two months in play, and sum 'Importe ' by concept.
+    channel's rows and the two months in play, and sum 'Importe ' by concept.
 
     Row order is the catalogue's order, showing only the concepts with activity
     in that block (the stakeholder's call; flip
@@ -513,7 +618,12 @@ def calcular_matrices(df, clave_anterior, clave_actual, grupos=None,
 
     mapeo, reporte = construir_mapeo_conceptos(df["_agrupador"], catalogo, umbral)
 
-    df = df.copy()
+    # '_grupo' is normally added by the caller (it also needs it for the
+    # unassigned-channel report); resolve it here only if it is missing.
+    if "_grupo" not in df.columns:
+        df = asignar_grupos(df, grupos)
+    else:
+        df = df.copy()
     df["_concepto"] = df["_agrupador"].map(mapeo)
 
     # Row label: the catalogue concept when matched, the raw value otherwise.
@@ -531,10 +641,9 @@ def calcular_matrices(df, clave_anterior, clave_actual, grupos=None,
     df["_fila"] = df["_agrupador"].map(etiquetas)
 
     matrices = []
-    for grupo in grupos:
-        analistas = [_normalizar(a) for a in grupo["analistas"]]
+    for indice, grupo in enumerate(grupos):
         sub = df[
-            df["_analista"].isin(analistas)
+            (df["_grupo"] == indice)
             & df["_mes"].isin([clave_anterior, clave_actual])
         ]
 
@@ -564,13 +673,9 @@ def calcular_matrices(df, clave_anterior, clave_actual, grupos=None,
         anterior = {c: sumas.get((c, clave_anterior), 0.0) for c in conceptos}
         actual   = {c: sumas.get((c, clave_actual),   0.0) for c in conceptos}
 
-        titulo = grupo["titulo"]
-        if grupo.get("mostrar_analista") and grupo["analistas"]:
-            titulo = f"{titulo} {' / '.join(a.title() for a in grupo['analistas'])}"
-
         matrices.append({
-            "titulo":         titulo,
-            "analistas":      grupo["analistas"],
+            "titulo":         grupo["titulo"],
+            "canales":        grupo["canales"],
             "conceptos":      conceptos,
             "anterior":       anterior,
             "actual":         actual,
@@ -731,9 +836,11 @@ def construir_variaciones(
     sobrescribir_original=False,
     con_comparativos=None,
     callback_status=None,
+    templates=None,
 ):
     """
-    Build the 'Variaciones' sheet of the Reservas workbook.
+    Build the 'Variaciones' sheet of the Reservas workbook, optionally pasting
+    the 'RESERVAS MANUALES' templates into 'Base' first.
 
     Args:
         ruta_libro (str): path to '07 Archivo Creacion de Reservas PMF OT.xlsx'.
@@ -750,9 +857,14 @@ def construir_variaciones(
         con_comparativos (bool|None): also build the two PivotTable sheets.
             None -> the CONSTRUIR_COMPARATIVOS flag.
         callback_status (function|None): progress reporting for the GUI.
+        templates (list[str]|None): paths of the 'RESERVAS MANUALES <CANAL>'
+            templates to paste into 'Base' BEFORE building the matrices. None or
+            empty -> no paste, the run is exactly the plain consolidation. If any
+            template fails validation nothing is written at all.
 
     Returns:
         dict: ruta, mes_anterior, mes_actual, filas_base, bloques, totales...
+              'pegado' holds the paste summary (None when no templates).
     """
     def update_status(mensaje):
         if callback_status:
@@ -761,6 +873,14 @@ def construir_variaciones(
     if con_comparativos is None:
         con_comparativos = CONSTRUIR_COMPARATIVOS
 
+    if templates and sobrescribir_original:
+        # A failed or half-verified paste cannot be rolled back in the user's
+        # own file, so the paste only ever runs against a COPY.
+        raise ValueError(
+            "Pegar los templates de Reservas Manuales sólo se permite sobre una "
+            "COPIA (sobrescribir_original=False)."
+        )
+
     clave_anterior, clave_actual = claves_mes_actual_y_anterior(mes)
     update_status(
         f"📅 Comparando {etiqueta_mes_es(clave_anterior)} vs "
@@ -768,10 +888,42 @@ def construir_variaciones(
     )
 
     update_status(f"📄 Leyendo la pestaña '{HOJA_BASE}'...")
-    df, fila_encabezado = leer_base(ruta_libro)
+    df, fila_encabezado, ultima_fila = leer_base(ruta_libro)
+
+    # --- Optional: plan the paste of the templates ---------------------
+    # Planned and validated COMPLETELY before anything is written: every
+    # template is read, checked and turned into the exact rows to paste, and the
+    # rows of 'Base' they replace are identified. The plan is applied to the
+    # in-memory DataFrame here (so the matrices already see the new rows) and to
+    # the workbook copy further down.
+    #
+    # Imported HERE, not at the top, because Reservas_Manuales imports this
+    # module (for GRUPOS, the helpers and the Base reader); a top-level import
+    # would be circular. Same reason PyInstaller needs --hidden-import for it.
+    plan = None
+    if templates:
+        from Reservas_Manuales import aplicar_plan_a_df, planificar_pegado
+
+        update_status(f"📥 Revisando {len(templates)} template(s) de Reservas Manuales...")
+        plan = planificar_pegado(
+            df, fila_encabezado, ultima_fila, templates, clave_actual, grupos,
+        )
+        df = aplicar_plan_a_df(df, plan)
+        for aviso in plan["advertencias"]:
+            update_status(f"⚠️ {aviso}")
+
+    df = asignar_grupos(df, grupos)
 
     update_status("🧮 Calculando las cinco matrices...")
     matrices, mapeo, reporte = calcular_matrices(df, clave_anterior, clave_actual, grupos)
+
+    # Money whose channel belongs to no block would silently be missing from
+    # every matrix, so it is reported with its amount.
+    huerfanas = df[(df["_grupo"] == -1) & df["_mes"].isin([clave_anterior, clave_actual])]
+    canales_sin_bloque = [
+        f"{canal or '(vacío)'} — {int(n)} fila(s), Σ {suma:,.2f}"
+        for canal, (n, suma) in huerfanas.groupby("_canal")["_importe"].agg(["size", "sum"]).iterrows()
+    ]
 
     no_mapeados = sorted({r["agrupador"] for r in reporte if r["concepto"] is None})
     if no_mapeados:
@@ -791,11 +943,41 @@ def construir_variaciones(
         ruta_final = os.path.join(ruta_salida, f"{base}_Variaciones_{clave_actual}.xlsx")
         shutil.copy2(ruta_libro, ruta_final)
 
-    update_status(f"🎨 Escribiendo la pestaña '{HOJA_VARIACIONES}'...")
-    wb = load_workbook(ruta_final)
-    escribir_variaciones(wb, matrices, clave_anterior, clave_actual)
-    wb.save(ruta_final)
-    wb.close()
+    pegado = None
+    try:
+        wb = load_workbook(ruta_final)
+        try:
+            info_escritura = None
+            if plan:
+                from Reservas_Manuales import aplicar_plan_a_libro
+
+                update_status(f"📥 Pegando los templates en la pestaña '{HOJA_BASE}'...")
+                info_escritura = aplicar_plan_a_libro(wb, plan)
+
+            update_status(f"🎨 Escribiendo la pestaña '{HOJA_VARIACIONES}'...")
+            escribir_variaciones(wb, matrices, clave_anterior, clave_actual)
+            wb.save(ruta_final)
+        finally:
+            wb.close()
+
+        if plan:
+            # Re-open what is ON DISK and compare it with the plan, cell by
+            # cell. A paste that "looked fine" in memory but landed wrong in the
+            # file must stop the run, not reach the stakeholder.
+            from Reservas_Manuales import resumir_pegado, verificar_pegado
+
+            update_status("🔎 Verificando lo pegado contra los templates...")
+            verificar_pegado(ruta_final, plan, info_escritura)
+            pegado = resumir_pegado(plan, info_escritura)
+    except Exception:
+        # The copy in 'Output' would be a half-done file that looks like a real
+        # result. Remove it; the original was never touched.
+        if not sobrescribir_original:
+            try:
+                os.remove(ruta_final)
+            except OSError:
+                pass
+        raise
 
     # --- Optional second pass: the two PivotTable sheets ---------------
     # Runs AFTER openpyxl has saved and closed, never before: openpyxl would
@@ -840,10 +1022,11 @@ def construir_variaciones(
         # it did not run, if it failed.
         "comparativos":         comparativos,
         "comparativos_error":   comparativos_error,
-        "analistas_sin_bloque": sorted(
-            set(df["_analista"].unique())
-            - {_normalizar(a) for g in (grupos or GRUPOS) for a in g["analistas"]}
-        ),
+        # Channels of the two compared months that belong to no block: their
+        # money is NOT in any matrix. Empty list = everything is accounted for.
+        "canales_sin_bloque":   canales_sin_bloque,
+        # Summary of the template paste (None when no templates were chosen).
+        "pegado":               pegado,
     }
 
 
@@ -854,9 +1037,13 @@ if __name__ == "__main__":
     print("=== Prueba de consolidación 'Variaciones' (standalone) ===")
     ruta = input("Ruta del archivo de Reservas (.xlsx): ").strip().strip('"')
     mes_txt = input("Mes a correr [Enter = hoy, o p.ej. M07-26]: ").strip() or None
+    rutas_txt = input("Templates de Reservas Manuales, separados por ';' [Enter = ninguno]: ")
+    templates_txt = [r.strip().strip('"') for r in rutas_txt.split(";") if r.strip()]
 
     try:
-        resumen = construir_variaciones(ruta, mes=mes_txt, callback_status=print)
+        resumen = construir_variaciones(
+            ruta, mes=mes_txt, callback_status=print, templates=templates_txt or None,
+        )
         print("\n🎉 LISTO 🎉")
         for clave, valor in resumen.items():
             print(f"  {clave:<22}: {valor}")

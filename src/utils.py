@@ -117,9 +117,15 @@ def carpeta_output_desde_input(ruta_input):
     Return the 'Output' folder that sits next to the input folder.
     If the chosen folder is named 'Input' the Output lands BESIDE it (src/Output); for any other folder the 
     Output is created INSIDE it, so nothing is scattered outside the user's choice.
+    A folder that is already named 'Output' is returned as it is: the result of
+    one step ('Traspasar templates') is the input of the next ('Consolidar'), and
+    that must not pile up 'Output/Output/Output'.
     """
     ruta = os.path.normpath(ruta_input)
-    if os.path.basename(ruta).lower() == "input":
+    nombre = os.path.basename(ruta).lower()
+    if nombre == "output":
+        return ruta
+    if nombre == "input":
         return os.path.join(os.path.dirname(ruta), "Output")
     return os.path.join(ruta, "Output")
 
