@@ -1,7 +1,7 @@
 """RDA Pólizas D&A — copies the finished 'PÓLIZA SAP' of the OT layout (both tabs) into the template
-'Póliza Carga Batch' ('GL Posting Upload'): one debit block, then one credit block (no GL Account).
-Runs after generar_poliza_sap(); pastes values, reads them back and saves only if identical.
-The template's orange cells (document number, company code, dates...) are NOT filled yet.
+'Póliza Carga Batch' ('GL Posting Upload'): one debit block, then one credit block.
+Runs after generar_poliza_sap(). Pastes values, fills the orange header fields on every row and the
+credit block's GL Account, reads everything back and saves only if it matches.
 """
 
 import math
@@ -23,7 +23,9 @@ from utils import cerrar_excel as _cerrar_excel
 from utils import error_de_excel as _error_de
 from utils import es_vacio_excel as _vacio
 from utils import hoja_por_nombre as _hoja
+from utils import mes_de_cierre
 from utils import norm_texto as _norm
+from utils import ultimo_dia_mes
 
 # --- Template layout ---
 HOJA_PLANTILLA = "GL Posting Upload"
@@ -38,8 +40,30 @@ DEST_CUENTA, DEST_DEBITO, DEST_CREDITO = "GL Account", "Debit Amount", "Credit A
 DEST_CEBE, DEST_SEGMENTO = "Profit Center", "Segment"
 DEST_ASIGNACION, DEST_TEXTO = "Assignment", "Line item Text"
 
+# Orange header fields: the same value on every row of both blocks.
+DEST_SECUENCIA, DEST_SOCIEDAD = "Document Sequence #", "Posting Company Code"
+DEST_FECHA_CONTABLE, DEST_FECHA_DOC = "Posting Date", "Document Date"
+DEST_PERIODO, DEST_MONEDA = "Period", "Currency"
+DEST_TIPO_DOC, DEST_CABECERA, DEST_REFERENCIA = "Document Type", "Document Header", "Reference"
+
+SECUENCIA, SOCIEDAD, MONEDA = 1, "MX21", "MXN"
+TIPO_DOC, CABECERA = "SA", "CREACION RESERVA"
+# Dates are written as TEXT in this format, so Excel never re-parses them by the machine's locale.
+FORMATO_FECHA = "%d.%m.%Y"
+
+# GL Account of the credit block, only for cells left empty: 'PROMOCIONAL' in the Line item Text -> first account.
+PALABRA_PROMOCIONAL = "PROMOCIONAL"
+CUENTA_PROMOCIONAL, CUENTA_RESTO = "0001011003", "0002031130"
+
+ENCABEZADOS_DESTINO = (
+    DEST_CUENTA, DEST_DEBITO, DEST_CREDITO, DEST_CEBE, DEST_SEGMENTO, DEST_ASIGNACION, DEST_TEXTO,
+    DEST_SECUENCIA, DEST_SOCIEDAD, DEST_FECHA_CONTABLE, DEST_FECHA_DOC, DEST_PERIODO,
+    DEST_MONEDA, DEST_TIPO_DOC, DEST_CABECERA, DEST_REFERENCIA,
+)
+
 # Key (in Create_Poliza_SAP.COLUMNAS_POLIZA) of the layout column feeding each header; letters are never repeated here.
 CLAVE_CUENTA = "cuenta"
+CLAVE_CONCEPTO = "concepto"
 # The column the amount is compared against, to warn when they differ.
 CLAVE_COMPARACION = "mxn" if CLAVE_MONTO != "mxn" else "redondeo"
 TRANSFERENCIAS = (
@@ -55,7 +79,7 @@ TRANSFERENCIAS = (
      "en_debito": True,  "en_credito": False},
     {"origen": CLAVE_MONTO,    "destino": DEST_CREDITO,
      "en_debito": False, "en_credito": True},
-    {"origen": "concepto",     "destino": DEST_TEXTO,
+    {"origen": CLAVE_CONCEPTO, "destino": DEST_TEXTO,
      "en_debito": True,  "en_credito": True},
 )
 
@@ -66,6 +90,8 @@ LONGITUD_MAX_SAP = {
     DEST_SEGMENTO: 10,
     DEST_ASIGNACION: 18,
     DEST_TEXTO: 50,
+    DEST_REFERENCIA: 16,
+    DEST_CABECERA: 25,
 }
 
 # --- Behaviour flags ---
@@ -96,6 +122,44 @@ def _nombre_salida(ruta_plantilla):
     limpio = re.sub(r"[\s_\-]*template.*$", "", base, flags=re.IGNORECASE).strip(" _-")
     sello = datetime.today().strftime("%Y%m%d")
     return f"{limpio or base}_{sello}{ext}"
+
+
+def referencia_de_usuario(ruta_perfil=None):
+    """User number after 'Users\\' in the profile folder (C:\\Users\\81113276 -> '81113276')."""
+    partes = [p for p in re.split(r"[\\/]+", ruta_perfil or os.path.expanduser("~")) if p]
+    for i, parte in enumerate(partes[:-1]):
+        if parte.lower() == "users":
+            return partes[i + 1]
+    raise ValueError(
+        f"No pude sacar el número de usuario de la carpeta '{ruta_perfil or os.path.expanduser('~')}': "
+        f"esperaba algo como C:\\Users\\<número>."
+    )
+
+
+def fecha_contable(mes=None):
+    """Posting Date: last day of the closing month as text ('31.10.2026' for 'M10-26'; None = current month)."""
+    return ultimo_dia_mes(mes_de_cierre(mes)).strftime(FORMATO_FECHA)
+
+
+def _campos_naranjas(mes, referencia):
+    """(header, value, as_text) of every orange field; dates and Period come from the closing month."""
+    fecha = fecha_contable(mes)
+    return (
+        (DEST_SECUENCIA, SECUENCIA, False),
+        (DEST_SOCIEDAD, SOCIEDAD, True),
+        (DEST_FECHA_CONTABLE, fecha, True),
+        (DEST_FECHA_DOC, fecha, True),
+        (DEST_PERIODO, mes_de_cierre(mes).month, False),
+        (DEST_MONEDA, MONEDA, True),
+        (DEST_TIPO_DOC, TIPO_DOC, True),
+        (DEST_CABECERA, CABECERA, True),
+        (DEST_REFERENCIA, referencia, True),
+    )
+
+
+def _cuenta_contrapartida(texto):
+    """'PROMOCIONAL' anywhere in the text (ignoring case and accents) -> promotional account, else the general one."""
+    return CUENTA_PROMOCIONAL if PALABRA_PROMOCIONAL in _norm(texto) else CUENTA_RESTO
 
 
 def _claves_origen():
@@ -299,10 +363,7 @@ def _hoja_plantilla(wb):
 def _localizar_destino(ws):
     """(fila_encabezado, {header: column index}) of the template, found by NAME so an inserted column
     still lands every value under the right header, or stops with a readable message."""
-    requeridos = {_norm(h): h for h in (
-        DEST_CUENTA, DEST_DEBITO, DEST_CREDITO, DEST_CEBE,
-        DEST_SEGMENTO, DEST_ASIGNACION, DEST_TEXTO,
-    )}
+    requeridos = {_norm(h): h for h in ENCABEZADOS_DESTINO}
 
     usado = ws.UsedRange
     ultima_col = max(int(usado.Column + usado.Columns.Count - 1), 1)
@@ -384,30 +445,70 @@ def _pegar_todo(app, ws_destino, columnas, bloques, secciones):
                 )
 
 
+def _rellenar_naranjas(ws, columnas, desde, hasta, campos):
+    """Write each orange field down every row. Text fields get the Text format first, so Excel keeps
+    them as typed ('81113276', '31.10.2026') instead of re-parsing them."""
+    for destino, valor, como_texto in campos:
+        rango = _rango_destino(ws, columnas[destino], desde, hasta)
+        rango.NumberFormat = "@" if como_texto else "General"
+        rango.Value2 = valor
+
+
+def _completar_cuentas(ws, columnas, desde, hasta):
+    """Fill ONLY the empty GL Account cells (the credit block) by the PROMOCIONAL rule on Line item Text.
+    Returns {account: count}. Text format first: the leading zeros of '0001011003' must survive."""
+    n = hasta - desde + 1
+    cuentas = _leer_rango(_rango_destino(ws, columnas[DEST_CUENTA], desde, hasta), n)
+    textos = _leer_rango(_rango_destino(ws, columnas[DEST_TEXTO], desde, hasta), n)
+    puestas = {}
+    i = 0
+    while i < n:
+        if not _vacio(cuentas[i]):
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and _vacio(cuentas[j + 1]):
+            j += 1
+        valores = [_cuenta_contrapartida(t) for t in textos[i:j + 1]]
+        rango = _rango_destino(ws, columnas[DEST_CUENTA], desde + i, desde + j)
+        rango.NumberFormat = "@"
+        rango.Value2 = tuple((v,) for v in valores)
+        for v in valores:
+            puestas[v] = puestas.get(v, 0) + 1
+        i = j + 1
+    return puestas
+
+
+def _comparar(destino, bloque, fila_ini, esperado, real):
+    """Readable differences between what a column should hold and what the template holds."""
+    malos = [(fila_ini + i, e, r) for i, (e, r) in enumerate(zip(esperado, real)) if e != r]
+    dif = [f"{destino} fila {f} ({bloque}): esperaba {e!r} y quedó {r!r}"
+           for f, e, r in malos[:MAX_DETALLE]]
+    if len(malos) > MAX_DETALLE:
+        dif.append(f"{destino} ({bloque}): ...y {len(malos) - MAX_DETALLE} más")
+    return dif
+
+
 def _verificar(ws_destino, columnas, bloques, datos, n):
     """Read the template back: returns (diferencias, sumas, total_origen); empty diferencias = identical.
-    Checks every pasted column cell by cell (catches lost leading zeros), that cells which must stay empty ARE empty,
-    and that debit total = credit total = layout total (all tabs)."""
+    Checks every pasted column cell by cell (catches lost leading zeros), the credit GL Account rule, that the
+    other cells stay empty, and that debit total = credit total = layout total (all tabs)."""
     diferencias = []
     sumas = {}
+    cuentas_credito = [_cuenta_contrapartida(v) for v in datos[CLAVE_CONCEPTO]["valores"]]
 
     for t in TRANSFERENCIAS:
-        esperado = datos[t["origen"]]["valores"]
         col_idx = columnas[t["destino"]]
         for bloque, bandera in (("debito", "en_debito"), ("credito", "en_credito")):
             r1, r2 = bloques[bloque]
             real = _leer_rango(_rango_destino(ws_destino, col_idx, r1, r2), n)
 
             if t[bandera]:
-                malos = [(r1 + i, e, r) for i, (e, r) in enumerate(zip(esperado, real)) if e != r]
-                for fila, e, r in malos[:MAX_DETALLE]:
-                    diferencias.append(
-                        f"{t['destino']} fila {fila} ({bloque}): esperaba {e!r} y quedó {r!r}"
-                    )
-                if len(malos) > MAX_DETALLE:
-                    diferencias.append(f"{t['destino']} ({bloque}): ...y {len(malos) - MAX_DETALLE} más")
+                diferencias += _comparar(t["destino"], bloque, r1, datos[t["origen"]]["valores"], real)
                 if t["destino"] in (DEST_DEBITO, DEST_CREDITO):
                     sumas[t["destino"]] = math.fsum(v for v in real if isinstance(v, (int, float)))
+            elif t["destino"] == DEST_CUENTA:
+                diferencias += _comparar(t["destino"], bloque, r1, cuentas_credito, real)
             else:
                 sucios = [r1 + i for i, v in enumerate(real) if not _vacio(v)]
                 if sucios:
@@ -427,18 +528,44 @@ def _verificar(ws_destino, columnas, bloques, datos, n):
     return diferencias, sumas, total_origen
 
 
+def _verificar_naranjas(ws_destino, columnas, desde, hasta, campos):
+    """Every orange field must read back as written on ALL rows (both blocks)."""
+    n = hasta - desde + 1
+    diferencias = []
+    for destino, valor, _ in campos:
+        real = _leer_rango(_rango_destino(ws_destino, columnas[destino], desde, hasta), n)
+        diferencias += _comparar(destino, "ambos bloques", desde, [valor] * n, real)
+    return diferencias
+
+
+def _avisos_referencia(referencia):
+    """Warnings (never blocking) about the user number used as 'Reference'."""
+    avisos = []
+    if not referencia.isdigit():
+        avisos.append(f"La referencia '{referencia}' (carpeta de usuario) no son sólo dígitos: revisa 'Reference'.")
+    limite = LONGITUD_MAX_SAP[DEST_REFERENCIA]
+    if len(referencia) > limite:
+        avisos.append(f"La referencia '{referencia}' excede los {limite} caracteres que SAP acepta.")
+    return avisos
+
+
 # --- Main entry point ---
 def generar_poliza_batch(
     ruta_layout,
     ruta_plantilla,
     ruta_salida=None,
     callback_status=None,
+    *,
+    mes=None,
+    referencia=None,
 ):
     """Fill 'Póliza Carga Batch Creaciones' from the layout ALREADY processed by generar_poliza_sap().
     Layout (read-only) and template are never modified; ruta_salida=None -> the layout's folder ('Output').
+    mes: closing month key ('M10-26', None = current month) -> Posting/Document Date and Period.
+    referencia: 'Reference' value; None = the user number from the profile folder (C:\\Users\\<number>).
     Returns: ruta, origen, hojas_origen, hoja, filas_origen, filas_totales, bloque_debito, bloque_credito,
-    total_debito, total_credito, columnas, advertencias. Raises FileNotFoundError/ValueError (fixable),
-    RuntimeError (Excel/clipboard/read-back failures), PermissionError (destination open in Excel)."""
+    total_debito, total_credito, naranjas, cuentas_credito, columnas, advertencias. Raises FileNotFoundError/
+    ValueError (fixable), RuntimeError (Excel/clipboard/read-back failures), PermissionError (destination open)."""
     def update_status(mensaje):
         if callback_status:
             callback_status(mensaje)
@@ -454,6 +581,10 @@ def generar_poliza_batch(
             f"La plantilla debe ser {' o '.join(EXTENSIONES_PLANTILLA)} y recibí "
             f"'{os.path.splitext(ruta_plantilla)[1]}'."
         )
+
+    # Resolved before touching any file: a bad month key or user folder fails here.
+    referencia = (referencia or "").strip() or referencia_de_usuario()
+    campos = _campos_naranjas(mes, referencia)
 
     carpeta = os.path.abspath(ruta_salida) if ruta_salida \
         else os.path.dirname(os.path.abspath(ruta_layout))
@@ -484,6 +615,10 @@ def generar_poliza_batch(
 
             # --- Read and validate the layout ----------------------------
             secciones, avisos_layout = localizar_secciones(wb_origen)
+            # A tab without data has filas == 0 and fila_fin None: nothing to copy from it.
+            secciones = [s for s in secciones if s["filas"] > 0]
+            if not secciones:
+                raise ValueError("El Layout no tiene renglones con datos en ninguna pestaña.")
             n = 0
             for s in secciones:
                 s["desplazamiento"] = n      # where this tab starts inside each block
@@ -495,7 +630,7 @@ def generar_poliza_batch(
             problemas, advertencias = _validar_origen(datos)
             if problemas:
                 raise ValueError(_texto_problemas(problemas, ruta_layout))
-            advertencias = list(avisos_layout) + advertencias
+            advertencias = list(avisos_layout) + advertencias + _avisos_referencia(referencia)
 
             # --- Locate the template columns -----------------------------
             fila_encabezado, columnas = _localizar_destino(ws_destino)
@@ -512,11 +647,18 @@ def generar_poliza_batch(
             update_status("✍️  Pegando valores en la plantilla (Débito)...")
             _pegar_todo(app, ws_destino, columnas, bloques, secciones)
 
+            # --- Orange fields + credit GL Account -------------------------
+            update_status("🟧 Llenando campos fijos y cuentas del bloque de crédito...")
+            desde, hasta = bloques["debito"][0], bloques["credito"][1]
+            _rellenar_naranjas(ws_destino, columnas, desde, hasta, campos)
+            cuentas_credito = _completar_cuentas(ws_destino, columnas, desde, hasta)
+
             # --- Read back and compare ------------------------------------
-            update_status("🧮 Verificando lo pegado contra el Layout...")
+            update_status("🧮 Verificando lo escrito contra el Layout...")
             diferencias, sumas, total_origen = _verificar(
                 ws_destino, columnas, bloques, datos, n
             )
+            diferencias += _verificar_naranjas(ws_destino, columnas, desde, hasta, campos)
             if diferencias:
                 raise RuntimeError(
                     "La verificación posterior al pegado encontró diferencias, así que "
@@ -539,6 +681,8 @@ def generar_poliza_batch(
                 "total_debito":   round(sumas.get(DEST_DEBITO, 0.0), 2),
                 "total_credito":  round(sumas.get(DEST_CREDITO, 0.0), 2),
                 "total_layout":   round(total_origen, 2),
+                "naranjas":       {destino: valor for destino, valor, _ in campos},
+                "cuentas_credito": cuentas_credito,
                 "columnas":       [f"{titulo_de(t['origen'])} → {t['destino']}"
                                    for t in TRANSFERENCIAS],
                 "advertencias":   advertencias,
@@ -580,15 +724,20 @@ if __name__ == "__main__":
     print("=== Prueba de 'Póliza Carga Batch' (standalone) ===")
     layout = input("Ruta del Layout OT YA procesado (.xlsx): ").strip().strip('"')
     plantilla = input("Ruta de la plantilla de Póliza Carga Batch (.xlsx): ").strip().strip('"')
+    mes_cierre = input("Mes de cierre (ej. M10-26, vacío = el mes en curso): ").strip().upper() or None
 
     try:
-        res = generar_poliza_batch(layout, plantilla, callback_status=print)
+        res = generar_poliza_batch(layout, plantilla, callback_status=print, mes=mes_cierre)
         print("\n🎉 LISTO 🎉")
         for clave, valor in res.items():
             if clave in ("columnas", "advertencias"):
                 print(f"  {clave:<16}:")
                 for v in valor:
                     print(f"      • {v}")
+            elif clave in ("naranjas", "cuentas_credito"):
+                print(f"  {clave:<16}:")
+                for k, v in valor.items():
+                    print(f"      • {k}: {v}")
             else:
                 print(f"  {clave:<16}: {valor}")
     except Exception as e:

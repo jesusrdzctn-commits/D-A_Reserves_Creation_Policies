@@ -9,7 +9,7 @@ from tkinter import messagebox
 
 from Comparativos import HOJA_COMPARATIVO_AGRUPADOR, HOJA_COMPARATIVO_BU
 from Consolidacion import GRUPOS, HOJA_VARIACIONES, construir_variaciones, resolver_grupo
-from Create_Poliza_Batch import generar_poliza_batch
+from Create_Poliza_Batch import fecha_contable, generar_poliza_batch
 from Create_Poliza_SAP import NOMBRES_HOJAS_LAYOUT, generar_poliza_sap
 from Reservas_Manuales import previsualizar_pegado, traspasar_templates
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
@@ -36,6 +36,15 @@ class ReservasController:
         indice = resolver_grupo(os.path.splitext(os.path.basename(ruta))[0])
         return None if indice is None else GRUPOS[indice]["canal"]
 
+    @staticmethod
+    def _claves_o_error(mes):
+        """(previous, current) month keys, or None after telling the user the month is invalid."""
+        try:
+            return claves_mes_actual_y_anterior(mes)
+        except ValueError as e:
+            messagebox.showerror("Periodo de cierre inválido", str(e))
+            return None
+
     # --- Shared runner ---
     def _ejecutar(self, funcion):
         """Run one consolidation -> (True, resumen) | (False, mensaje); touches no buttons or popups, so 'todo' survives a failed step."""
@@ -59,7 +68,7 @@ class ReservasController:
         except Exception as e:
             return False, f"Ocurrió un error inesperado:\n\n{e}"
 
-    def _ejecutar_poliza(self, ruta_layout, ruta_plantilla):
+    def _ejecutar_poliza(self, ruta_layout, ruta_plantilla, mes=None):
         """Process 2 end to end: layout 'PÓLIZA SAP', then 'Póliza Carga Batch'. (True, resumen) when the layout worked
         (resumen['batch'] / ['batch_error'] carry the batch outcome), (False, mensaje) otherwise."""
         ok, resumen = self._ejecutar(lambda: generar_poliza_sap(
@@ -71,7 +80,7 @@ class ReservasController:
         self.gui.set_status("📦 Llenando la 'Póliza Carga Batch'...")
         # resumen['ruta'] is the processed copy in 'Output': the batch reads it and lands there too.
         ok_batch, payload_batch = self._ejecutar(lambda: generar_poliza_batch(
-            resumen["ruta"], ruta_plantilla, callback_status=self.gui.set_status,
+            resumen["ruta"], ruta_plantilla, callback_status=self.gui.set_status, mes=mes,
         ))
         resumen["batch"]       = payload_batch if ok_batch else None
         resumen["batch_error"] = None if ok_batch else payload_batch
@@ -201,6 +210,11 @@ class ReservasController:
 
         ruta_libro     = self.gui.get_archivo_poliza()
         ruta_plantilla = self.gui.get_archivo_batch()
+        mes            = self.gui.get_mes()
+        claves         = self._claves_o_error(mes)
+        if claves is None:
+            return
+        actual = claves[1]
 
         confirm = messagebox.askyesno(
             "Confirmar póliza SAP",
@@ -209,7 +223,9 @@ class ReservasController:
             f"  📑 Pestañas: {' + '.join(NOMBRES_HOJAS_LAYOUT)}\n"
             f"  ✍️  Sección : 'PÓLIZA SAP' de cada pestaña\n"
             f"  📦 Plantilla: {os.path.basename(ruta_plantilla)}\n"
-            f"     (se llena con los valores de la póliza)\n\n"
+            f"     (se llena con los valores de la póliza)\n"
+            f"  📅 Cierre   : {actual} ({etiqueta_mes_es(actual)})\n"
+            f"     Posting Date {fecha_contable(mes)}, Period {int(actual[1:3])}\n\n"
             f"Se abrirá Excel en segundo plano y se trabajará sobre COPIAS\n"
             f"en la subcarpeta 'Output'. Los originales no se tocan."
         )
@@ -219,7 +235,7 @@ class ReservasController:
         self.gui.disable_buttons()
         try:
             self.gui.marcar_paso("poliza", "en_curso")
-            ok, payload = self._ejecutar_poliza(ruta_libro, ruta_plantilla)
+            ok, payload = self._ejecutar_poliza(ruta_libro, ruta_plantilla, mes)
             if ok and not payload["batch_error"]:
                 self.gui.marcar_paso("poliza", "listo")
                 self.gui.set_status("✅ ¡Póliza SAP completada!")
@@ -251,7 +267,10 @@ class ReservasController:
         ruta_pol = self.gui.get_archivo_poliza()
         ruta_bat = self.gui.get_archivo_batch()
         mes      = self.gui.get_mes()
-        anterior, actual = claves_mes_actual_y_anterior(mes)
+        claves   = self._claves_o_error(mes)
+        if claves is None:
+            return
+        anterior, actual = claves
 
         self.gui.disable_buttons()
         try:
@@ -263,7 +282,8 @@ class ReservasController:
                 f"      📅 {anterior} vs {actual}\n\n"
                 f"  3️⃣  'PÓLIZA SAP' + Póliza Carga Batch\n"
                 f"      📄 {os.path.basename(ruta_pol)}\n"
-                f"      📦 {os.path.basename(ruta_bat)}\n\n"
+                f"      📦 {os.path.basename(ruta_bat)}\n"
+                f"      📅 Posting Date {fecha_contable(mes)}\n\n"
                 f"Ambos escriben sobre COPIAS en la subcarpeta 'Output'."
             )
             if not confirm:
@@ -291,7 +311,7 @@ class ReservasController:
             # --- Step 3 ---------------------------------------------------
             self.gui.marcar_paso("poliza", "en_curso")
             self.gui.set_status("3️⃣  Generando la 'PÓLIZA SAP'...")
-            ok2, payload2 = self._ejecutar_poliza(ruta_pol, ruta_bat)
+            ok2, payload2 = self._ejecutar_poliza(ruta_pol, ruta_bat, mes)
             # Step 3 counts as fully OK only if the batch file was also produced.
             batch_fallo = ok2 and bool(payload2["batch_error"])
             self.gui.marcar_paso(
@@ -531,6 +551,19 @@ class ReservasController:
         return texto
 
     @staticmethod
+    def _texto_naranjas(batch):
+        """Fixed fields and credit-block accounts the batch step filled, for the popup."""
+        n = batch["naranjas"]
+        cuentas = ", ".join(f"{cuenta} × {total:,}" for cuenta, total in batch["cuentas_credito"].items())
+        return (
+            f"  • Fechas / Period  : {n['Posting Date']} / {n['Period']}\n"
+            f"  • Reference        : {n['Reference']}\n"
+            f"  • Fijos            : Seq {n['Document Sequence #']} · {n['Posting Company Code']} · "
+            f"{n['Currency']} · {n['Document Type']} · {n['Document Header']}\n"
+            f"  • GL Account crédito: {cuentas or '(ninguna celda vacía)'}"
+        )
+
+    @staticmethod
     def _texto_batch(resumen):
         """'Póliza Carga Batch' half of the popup: produced (with its warnings) or not.
         Not producing it is no error dialog (the layout is already saved) but must not be silent."""
@@ -556,7 +589,8 @@ class ReservasController:
             f"  • Bloque crédito   : filas {c_ini}–{c_fin} ({batch['filas_origen']:,})\n"
             f"  • Σ Debit Amount   : {batch['total_debito']:,.2f}\n"
             f"  • Σ Credit Amount  : {batch['total_credito']:,.2f}\n"
-            f"  ✅ Verificado: lo pegado coincide con el Layout, celda por celda."
+            f"{ReservasController._texto_naranjas(batch)}\n"
+            f"  ✅ Verificado: lo pegado y los campos fijos se leyeron de vuelta y coinciden."
         )
 
         advertencias = batch.get("advertencias") or []
@@ -565,8 +599,4 @@ class ReservasController:
                 f"     • {a}" for a in advertencias
             )
 
-        texto += (
-            "\n\nℹ️ Todavía sin llenar en la plantilla: 'GL Account' del bloque de\n"
-            "crédito y los campos naranjas (Company Code, fechas, etc.)."
-        )
         return texto

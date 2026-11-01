@@ -3,6 +3,7 @@
 win32com is imported inside abrir_excel(), so this file imports cleanly without Excel.
 """
 
+import calendar
 import os
 import unicodedata
 from datetime import datetime
@@ -42,6 +43,20 @@ def mes_anterior(fecha):
     if primero.month == 1:
         return primero.replace(year=primero.year - 1, month=12)
     return primero.replace(month=primero.month - 1)
+
+
+def mes_de_cierre(fecha=None):
+    """First day of the closing month: None = today's month, a month key ('M10-26') or a datetime."""
+    if fecha is None:
+        fecha = datetime.today()
+    elif isinstance(fecha, str):
+        fecha = parse_clave_mes(fecha)
+    return fecha.replace(day=1)
+
+
+def ultimo_dia_mes(fecha):
+    """Last day of the month of `fecha` (any day of October 2026 -> 31.10.2026)."""
+    return fecha.replace(day=calendar.monthrange(fecha.year, fecha.month)[1])
 
 
 def claves_mes_actual_y_anterior(fecha=None):

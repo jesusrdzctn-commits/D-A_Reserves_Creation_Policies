@@ -68,9 +68,9 @@ class Paleta:
     texto     = "#1B2540"
     suave     = "#6B7690"   # secondary text
     riel_texto = "#AEB8E6"  # secondary text on the rail
-    acento    = "#0067B1"
+    acento    = "#080808"
     teal      = "#17808F"
-    verde     = "#1E9E5A"
+    verde     = "#034E26"
     ambar     = "#E59A0B"
     rojo      = "#D64545"
     chip      = "#3B5BA9"   # small helper buttons
@@ -88,7 +88,7 @@ ESTADOS = {
 
 # step key -> (number, short title for the rail, title of the card)
 PASOS = (
-    ("traspaso",      "1", "Traspasar templates",   "Traspasar templates a 'Base'"),
+    ("traspaso",      "1", "Traspasar templates",   "Traspasar templates a 'Base' (opcional)"),
     ("consolidacion", "2", "Consolidar Variaciones", "Consolidar Variaciones"),
     ("poliza",        "3", "Póliza SAP",             "Generar Póliza SAP"),
 )
@@ -572,7 +572,7 @@ class ReservasGUI:
             parent, "poliza",
             "Llena 'PÓLIZA SAP' en las pestañas 'Reservas Manuales' y 'Reservas Rentas' "
             "del Layout OT y de ahí la plantilla 'Póliza Carga Batch', el archivo que se "
-            "sube a SAP. No usa el periodo.",
+            "sube a SAP. Usa el periodo para las fechas y el Period.",
         )
         self._fila_archivo(interior, self.archivo_poliza_var, self._elegir_archivo_poliza,
                            etiqueta="Layout OT (.xlsx)")
@@ -912,18 +912,22 @@ class ReservasGUI:
                 return False
         return True
 
-    def _validar_archivo_y_mes(self):
-        """Checks shared by the paste and the consolidation (same file, same month)."""
-        if not self._validar_ruta(
-            self.get_archivo(), "Creación de Reservas PMF", {".xlsx", ".xlsm"}
-        ):
-            return False
+    def _validar_mes(self):
+        """The closing month must be empty (current month) or a valid key such as M10-26."""
         try:
             claves_mes_actual_y_anterior(self.get_mes())
         except ValueError as e:
             messagebox.showerror("Mes inválido", str(e))
             return False
         return True
+
+    def _validar_archivo_y_mes(self):
+        """Checks shared by the paste and the consolidation (same file, same month)."""
+        if not self._validar_ruta(
+            self.get_archivo(), "Creación de Reservas PMF", {".xlsx", ".xlsm"}
+        ):
+            return False
+        return self._validar_mes()
 
     def validate_variaciones(self):
         if not self._validar_archivo_y_mes():
@@ -971,6 +975,8 @@ class ReservasGUI:
         return True
 
     def validate_poliza(self):
+        if not self._validar_mes():
+            return False
         if not self._validar_ruta(
             self.get_archivo_poliza(), "Layout OT",
             {".xlsx", ".xlsm"}
