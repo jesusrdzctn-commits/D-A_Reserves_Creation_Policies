@@ -18,6 +18,7 @@ ARCHIVOS_REQUERIDOS = [
     "Reservas_Manuales.py",
     "Create_Poliza_SAP.py",
     "Create_Poliza_Batch.py",
+    "Upload_SAP.py",
     "utils.py",
 ]
 
@@ -34,13 +35,13 @@ def install_pyinstaller():
 
 
 def check_pywin32():
-    """pywin32 lets Create_Poliza_SAP/Batch drive Excel; without it the 'PÓLIZA SAP' button fails at run time, not at build time."""
+    """pywin32 lets Create_Poliza_SAP/Batch drive Excel and Upload_SAP drive SAP GUI; without it those buttons fail at run time, not at build time."""
     try:
         import win32com.client  # noqa: F401
         print("✅ pywin32 ya está instalado")
         return True
     except ImportError:
-        print("⚠️  pywin32 NO está instalado — el proceso de 'PÓLIZA SAP' no funcionará")
+        print("⚠️  pywin32 NO está instalado — 'PÓLIZA SAP' y 'Subir a SAP' no funcionarán")
         print("    Instálalo con:  pip install pywin32")
         return False
 
@@ -67,6 +68,7 @@ def create_executable():
 
         # Process 2 ('PÓLIZA SAP') and the comparison pivots drive Excel through COM; utils.abrir_excel() imports
         # win32com INSIDE the function (so the module still imports without Excel), which PyInstaller cannot trace.
+        # Upload_SAP.py ('Subir a SAP') does the same to reach SAP GUI.
         "--hidden-import=win32com",
         "--hidden-import=win32com.client",
         "--hidden-import=pythoncom",
@@ -109,6 +111,7 @@ def create_executable():
             print("   (el .exe NO funciona si se saca solo de la carpeta)")
             print("3. No requiere tener Python instalado")
             print("4. SÍ requiere tener Excel instalado para el botón de 'PÓLIZA SAP'")
+            print("   y SAP GUI abierto con una sesión activa para el botón 'Subir a SAP'")
             print("5. Botón 'Examinar...' de cada bloque → elegir su archivo")
             print("6. Los resultados se guardan en una subcarpeta 'Output'")
             print("   junto a cada archivo elegido. Los originales NO se modifican.")

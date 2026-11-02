@@ -445,16 +445,57 @@ def _pegar_todo(app, ws_destino, columnas, bloques, secciones):
                 )
 
 
-def _rellenar_naranjas(ws, columnas, desde, hasta, campos):
+def _fijar_formato(rango, formato):
+    """Apply `formato` unless the range already has it. False when Excel refuses it (typically a
+    protected sheet that allows typing in the cells but not formatting them)."""
+    try:
+        if rango.NumberFormat == formato:
+            return True
+        rango.NumberFormat = formato
+        return True
+    except Exception:  # com_error
+        return False
+
+
+def _con_apostrofe(valor):
+    """Text with a leading apostrophe: a scalar, or a column tuple of 1-tuples."""
+    if isinstance(valor, tuple):
+        return tuple(("'" + fila[0],) for fila in valor)
+    return "'" + valor
+
+
+def _escribir(ws, rango, titulo, valor, como_texto, avisos):
+    """Write `valor` under the wanted format. If Excel refuses the format, text goes in with a leading
+    apostrophe (what was typed by hand): it stays text and the read-back checks what was really stored."""
+    if not _fijar_formato(rango, "@" if como_texto else "General") and como_texto:
+        valor = _con_apostrofe(valor)
+        aviso = (f"Excel no dejó dar formato Texto a '{titulo}' (¿hoja protegida?): "
+                 f"se escribió con apóstrofo y la verificación lo confirmó.")
+        if avisos is not None and aviso not in avisos:
+            avisos.append(aviso)
+    try:
+        rango.Value2 = valor
+    except Exception as e:  # com_error
+        try:
+            protegida = bool(ws.ProtectContents)
+        except Exception:
+            protegida = False
+        causa = (f"La hoja '{ws.Name}' está PROTEGIDA: quita la protección (o desbloquea esas celdas) "
+                 f"y vuelve a intentar." if protegida else "¿La plantilla está en solo lectura o protegida?")
+        raise RuntimeError(
+            f"Excel no me dejó escribir en la columna '{titulo}' de la plantilla:\n\n{e}\n\n{causa}"
+        ) from e
+
+
+def _rellenar_naranjas(ws, columnas, desde, hasta, campos, avisos=None):
     """Write each orange field down every row. Text fields get the Text format first, so Excel keeps
     them as typed ('81113276', '31.10.2026') instead of re-parsing them."""
     for destino, valor, como_texto in campos:
         rango = _rango_destino(ws, columnas[destino], desde, hasta)
-        rango.NumberFormat = "@" if como_texto else "General"
-        rango.Value2 = valor
+        _escribir(ws, rango, destino, valor, como_texto, avisos)
 
 
-def _completar_cuentas(ws, columnas, desde, hasta):
+def _completar_cuentas(ws, columnas, desde, hasta, avisos=None):
     """Fill ONLY the empty GL Account cells (the credit block) by the PROMOCIONAL rule on Line item Text.
     Returns {account: count}. Text format first: the leading zeros of '0001011003' must survive."""
     n = hasta - desde + 1
@@ -471,8 +512,7 @@ def _completar_cuentas(ws, columnas, desde, hasta):
             j += 1
         valores = [_cuenta_contrapartida(t) for t in textos[i:j + 1]]
         rango = _rango_destino(ws, columnas[DEST_CUENTA], desde + i, desde + j)
-        rango.NumberFormat = "@"
-        rango.Value2 = tuple((v,) for v in valores)
+        _escribir(ws, rango, DEST_CUENTA, tuple((v,) for v in valores), True, avisos)
         for v in valores:
             puestas[v] = puestas.get(v, 0) + 1
         i = j + 1
@@ -650,8 +690,9 @@ def generar_poliza_batch(
             # --- Orange fields + credit GL Account -------------------------
             update_status("🟧 Llenando campos fijos y cuentas del bloque de crédito...")
             desde, hasta = bloques["debito"][0], bloques["credito"][1]
-            _rellenar_naranjas(ws_destino, columnas, desde, hasta, campos)
-            cuentas_credito = _completar_cuentas(ws_destino, columnas, desde, hasta)
+            avisos_formato = []
+            _rellenar_naranjas(ws_destino, columnas, desde, hasta, campos, avisos_formato)
+            cuentas_credito = _completar_cuentas(ws_destino, columnas, desde, hasta, avisos_formato)
 
             # --- Read back and compare ------------------------------------
             update_status("🧮 Verificando lo escrito contra el Layout...")
@@ -665,6 +706,8 @@ def generar_poliza_batch(
                     "NO se generó la Póliza Carga Batch:\n\n"
                     + "\n".join(f"     • {d}" for d in diferencias)
                 )
+
+            advertencias = advertencias + avisos_formato
 
             update_status("💾 Guardando...")
             wb_destino.Save()

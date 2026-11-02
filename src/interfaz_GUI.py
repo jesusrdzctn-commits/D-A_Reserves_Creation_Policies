@@ -2,7 +2,7 @@
 RDA Pólizas D&A — interfaz_GUI.py
 =================================
 
-tkinter GUI for the month-end close of the two Reservas workbooks. Three steps,
+tkinter GUI for the month-end close of the two Reservas workbooks. Four steps,
 top to bottom, the way the stakeholder runs them every month:
 
     1  Traspasar templates   the five 'RESERVAS <CANAL>' templates (tabs
@@ -12,8 +12,8 @@ top to bottom, the way the stakeholder runs them every month:
     3  Generar Póliza SAP    Layout OT (.xlsx, tabs 'Reservas Manuales' + 'Reservas Rentas')
                              -> sección 'PÓLIZA SAP' of each tab
                              + plantilla 'Póliza Carga Batch' (.xlsx), the file SAP gets
-
-A fourth button runs steps 2 and 3 in sequence.
+    4  Subir a SAP           opens the upload transaction in SAP GUI and loads the 'Póliza Carga
+                             Batch' that step 3 generated (it does not execute it yet)
 
 Design: the look of a trade-spend / Discounts & Allowances workbench. A navy side
 rail holds the context (period) and the progress of the close, one coloured dot
@@ -35,6 +35,7 @@ import json
 import os
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
 
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
@@ -65,15 +66,16 @@ class Paleta:
     campo     = "#F5F7FB"   # entries and lists
     navy      = "#00094F"   # side rail, primary
     navy_suave = "#1A2370"  # lines on the rail
+    navy_brillo = "#2C3894" # light edge of the rail (catches the "light")
+    sombra    = "#000521"   # tint of the shadow the rail casts
     texto     = "#1B2540"
     suave     = "#6B7690"   # secondary text
     riel_texto = "#AEB8E6"  # secondary text on the rail
     acento    = "#080808"
-    teal      = "#17808F"
+    negro     = "#000000"   # 'Examinar...' buttons
     verde     = "#034E26"
     ambar     = "#E59A0B"
     rojo      = "#D64545"
-    chip      = "#3B5BA9"   # small helper buttons
 
 
 # state -> (label, text colour, chip background, symbol)
@@ -88,9 +90,10 @@ ESTADOS = {
 
 # step key -> (number, short title for the rail, title of the card)
 PASOS = (
-    ("traspaso",      "1", "Traspasar templates",   "Traspasar templates a 'Base' (opcional)"),
+    ("traspaso",      "1", "Traspasar layouts",   "Traspasar layouts a 'Base' (opcional)"),
     ("consolidacion", "2", "Consolidar Variaciones", "Consolidar Variaciones"),
     ("poliza",        "3", "Póliza SAP",             "Generar Póliza SAP"),
+    ("subida",        "4", "Subir a SAP",            "Subir a SAP"),
 )
 
 
@@ -98,6 +101,26 @@ def _oscurecer(color, factor=0.12):
     """'#RRGGBB' darkened by `factor` (hover / pressed states)."""
     r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
     return "#%02X%02X%02X" % tuple(int(c * (1 - factor)) for c in (r, g, b))
+
+
+def _resaltar(color, factor=0.12):
+    """Hover / pressed shade of `color`: darker, or lighter when it is near black (black cannot get darker)."""
+    r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    if max(r, g, b) >= 48:
+        return _oscurecer(color, factor)
+    return "#%02X%02X%02X" % tuple(int(c + (255 - c) * factor * 1.5) for c in (r, g, b))
+
+
+def _degradado_sombra(fondo, tinte, ancho, opacidad):
+    """`ancho` hex colours: `tinte` blended over `fondo` at `opacidad` next to the rail, fading to plain `fondo`.
+    Tk has no alpha channel, so the blend is computed against the known background."""
+    base = [int(fondo[i:i + 2], 16) for i in (1, 3, 5)]
+    sombra = [int(tinte[i:i + 2], 16) for i in (1, 3, 5)]
+    colores = []
+    for i in range(ancho):
+        alfa = opacidad * (1 - i / ancho) ** 2      # quadratic falloff = soft, diffused edge
+        colores.append("#%02X%02X%02X" % tuple(round(b + (s - b) * alfa) for b, s in zip(base, sombra)))
+    return colores
 
 
 def activar_dpi_alto():
@@ -146,8 +169,9 @@ class BotonRedondeado(tk.Canvas):
                  fg="#FFFFFF", fuente=(FUENTE, 10, "bold"), alto=42, radio=10, ancho=None):
         super().__init__(parent, height=alto, bg=fondo_padre, highlightthickness=0,
                          bd=0, takefocus=1, cursor="hand2")
-        if ancho:
-            self.configure(width=ancho)
+        # Minimum width = the text plus margins. A Canvas asks for ~394 px by default, which would
+        # force every column that wide; buttons packed with fill="x" stretch to their card anyway.
+        self.configure(width=ancho or tkfont.Font(root=parent, font=fuente).measure(texto) + 32)
         self._texto, self._comando = texto, comando
         self._color, self._fg, self._fuente, self._radio = color, fg, fuente, radio
         self._habilitado = True
@@ -177,9 +201,9 @@ class BotonRedondeado(tk.Canvas):
         if not self._habilitado:
             relleno = self.DESHABILITADO
         elif self._presionado:
-            relleno = _oscurecer(self._color, 0.24)
+            relleno = _resaltar(self._color, 0.24)
         elif self._hover:
-            relleno = _oscurecer(self._color, 0.10)
+            relleno = _resaltar(self._color, 0.10)
         else:
             relleno = self._color
         borde = Paleta.ambar if (self._foco and self._habilitado) else relleno
@@ -260,7 +284,7 @@ class ReservasGUI:
         self.on_traspasar  = None   # templates -> 'Base' (copy of archivo 1)
         self.on_consolidar = None   # archivo 1 -> 'Variaciones'
         self.on_poliza     = None   # archivo 2 -> 'PÓLIZA SAP'
-        self.on_todo       = None   # steps 2 and 3, in order
+        self.on_subir      = None   # Carga Batch -> SAP (opens the transaction, no F8 yet)
 
         self._config_file = _ruta_config()
         cfg = self._cargar_config()
@@ -291,6 +315,10 @@ class ReservasGUI:
         self.templates = []
         self.carpeta_templates = (cfg.get("ultima_carpeta_templates") or "").strip()
 
+        # The 'Póliza Carga Batch' step 3 produced in THIS session, the file step 4 uploads. Deliberately
+        # NOT restored from config.json: last month's file must never sit armed and get uploaded by a click.
+        self.ruta_subida = ""
+
         # Channel checklist: the controller says which channels to expect and how
         # to read one from a file name (the GUI knows nothing about the rules).
         self._canales_esperados = []
@@ -303,11 +331,12 @@ class ReservasGUI:
         self._ocupado = False
 
         self._build_ui()
-        self._ajustar_al_contenido()
         self._refrescar_pasos()
         self._actualizar_preview_mes()
         self.archivo_var.trace_add("write", lambda *_: self._actualizar_archivo_trabajo())
         self._actualizar_archivo_trabajo()
+        # Last: the window is measured once every chip and label already has its text.
+        self._ajustar_al_contenido()
 
     # ------------------------------------------------------------------
     # Window geometry
@@ -373,22 +402,38 @@ class ReservasGUI:
 
         principal = tk.Frame(self.root, bg=Paleta.fondo, padx=20, pady=16)
         principal.pack(side=tk.LEFT, fill="both", expand=True)
+        self._dibujar_sombra_riel(riel)
 
         # Footer first (side=bottom) so it is never pushed out when the window is short.
         self._build_pie(principal)
 
-        self.tarjeta_traspaso = self._build_tarjeta_traspaso(principal)
-        self.tarjeta_traspaso.pack(fill="x")
-
-        fila = tk.Frame(principal, bg=Paleta.fondo)
-        fila.pack(fill="both", expand=True, pady=(12, 0))
-        fila.columnconfigure(0, weight=5, uniform="tarjetas")
-        fila.columnconfigure(1, weight=6, uniform="tarjetas")
-        fila.rowconfigure(0, weight=1)
-        self._build_tarjeta_consolidacion(fila).grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self._build_tarjeta_poliza(fila).grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        # Step 1 spans the top row; steps 2, 3 and 4 share the second one in equal columns.
+        # Step 4 is just a button: "new" keeps its natural height instead of stretching to its neighbours.
+        cuadricula = tk.Frame(principal, bg=Paleta.fondo)
+        cuadricula.pack(fill="both", expand=True)
+        for columna in range(3):
+            cuadricula.columnconfigure(columna, weight=1, uniform="tarjetas")
+        cuadricula.rowconfigure(1, weight=1)
+        self._build_tarjeta_traspaso(cuadricula).grid(
+            row=0, column=0, columnspan=3, sticky="nsew", pady=(0, 12))
+        # Margins (0,8) / (4,4) / (8,0): 12 px between cards and the three come out exactly as wide.
+        self._build_tarjeta_consolidacion(cuadricula).grid(
+            row=1, column=0, sticky="nsew", padx=(0, 8))
+        self._build_tarjeta_poliza(cuadricula).grid(row=1, column=1, sticky="nsew", padx=4)
+        self._build_tarjeta_subida(cuadricula).grid(row=1, column=2, sticky="new", padx=(8, 0))
 
     # --- side rail ----------------------------------------------------
+    def _dibujar_sombra_riel(self, riel):
+        """3D look: a soft shadow cast on the work area plus a light 1 px edge on the rail itself."""
+        ancho = 18      # narrower than the 20 px gutter next to the rail, so it never touches a card
+        sombra = tk.Canvas(self.root, width=ancho, bg=Paleta.fondo, highlightthickness=0, bd=0)
+        alto = self.root.winfo_screenheight()   # taller than any window: the canvas clips the lines
+        for x, color in enumerate(_degradado_sombra(Paleta.fondo, Paleta.sombra, ancho, 0.34)):
+            sombra.create_line(x, 0, x, alto, fill=color)
+        # Overlay glued to the rail's right edge: it takes no layout space.
+        sombra.place(in_=riel, relx=1.0, y=0, relheight=1)
+        tk.Frame(riel, bg=Paleta.navy_brillo, width=1).place(relx=1.0, x=-1, y=0, relheight=1)
+
     def _build_riel(self, riel):
         marca = tk.Frame(riel, bg=Paleta.navy, padx=22, pady=20)
         marca.pack(fill="x")
@@ -468,8 +513,8 @@ class ReservasGUI:
         tk.Frame(riel, bg=Paleta.navy_suave, height=1).pack(fill="x", padx=22, pady=10)
 
     # --- cards --------------------------------------------------------
-    def _tarjeta(self, parent, paso, descripcion):
-        """A white card with a numbered header, a state chip and a description."""
+    def _tarjeta(self, parent, paso, descripcion=None):
+        """A white card with a numbered header, a state chip and (optionally) a description."""
         numero, titulo = next((n, t) for c, n, _, t in PASOS if c == paso)
         marco = tk.Frame(parent, bg=Paleta.tarjeta, highlightthickness=1,
                          highlightbackground=Paleta.borde, highlightcolor=Paleta.borde)
@@ -488,11 +533,12 @@ class ReservasGUI:
         chip.pack(side=tk.RIGHT)
         self._chips_paso[paso] = chip
 
-        texto = tk.Label(interior, text=descripcion, font=(FUENTE, 9), fg=Paleta.suave,
-                         bg=Paleta.tarjeta, justify="left", anchor="w", wraplength=300)
-        texto.pack(fill="x", pady=(4, 6))
-        # The description wraps to whatever width the card ends up with.
-        texto.bind("<Configure>", lambda e, t=texto: t.configure(wraplength=max(e.width - 4, 120)))
+        if descripcion:
+            texto = tk.Label(interior, text=descripcion, font=(FUENTE, 9), fg=Paleta.suave,
+                             bg=Paleta.tarjeta, justify="left", anchor="w", wraplength=300)
+            texto.pack(fill="x", pady=(4, 6))
+            # The description wraps to whatever width the card ends up with.
+            texto.bind("<Configure>", lambda e, t=texto: t.configure(wraplength=max(e.width - 4, 120)))
         return marco, interior
 
     def _build_tarjeta_traspaso(self, parent):
@@ -524,15 +570,15 @@ class ReservasGUI:
         )
         self.templates_lista.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 8))
 
-        # Small helpers of the list: lighter than the action buttons.
+        # Small helpers of the list: smaller than the action buttons and in italics.
         ayudas = tk.Frame(fila, bg=Paleta.tarjeta)
         ayudas.pack(side=tk.LEFT, fill="y")
         for texto, comando in (("Agregar...", self._agregar_templates),
                                ("Quitar", self._quitar_templates),
                                ("Limpiar", self._limpiar_templates)):
             BotonRedondeado(
-                ayudas, texto, comando, Paleta.chip, Paleta.tarjeta,
-                fuente=(FUENTE, 8, "bold"), alto=26, radio=8, ancho=92,
+                ayudas, texto, comando, Paleta.suave, Paleta.tarjeta,
+                fuente=(FUENTE, 8, "bold italic"), alto=26, radio=8, ancho=92,
             ).pack(pady=(0, 3))
 
         self.templates_resumen_var = tk.StringVar()
@@ -541,8 +587,8 @@ class ReservasGUI:
                  justify="left").pack(fill="x", pady=(2, 6))
 
         self.traspasar_btn = BotonRedondeado(
-            interior, "📥  Traspasar templates a 'Base'", self._handle_traspasar,
-            Paleta.teal, Paleta.tarjeta, alto=38,
+            interior, "📥  Traspasar layouts...", self._handle_traspasar,
+            Paleta.navy, Paleta.tarjeta, alto=38,
         )
         self.traspasar_btn.pack(fill="x")
         self._refrescar_templates()
@@ -556,13 +602,16 @@ class ReservasGUI:
         )
         self._etiqueta(interior, "Trabajará sobre (copia del paso 1):")
         self.archivo_trabajo_var = tk.StringVar()
-        tk.Label(interior, textvariable=self.archivo_trabajo_var, font=(FUENTE, 9, "bold"),
-                 fg=Paleta.navy, bg=Paleta.campo, anchor="w", justify="left", padx=8, pady=6,
-                 wraplength=260).pack(fill="x")
+        trabajo = tk.Label(interior, textvariable=self.archivo_trabajo_var, font=(FUENTE, 9, "bold"),
+                           fg=Paleta.navy, bg=Paleta.campo, anchor="w", justify="left", padx=8,
+                           pady=6, wraplength=240)
+        trabajo.pack(fill="x")
+        # The file name wraps to the card's width (a third of the window), never wider than it.
+        trabajo.bind("<Configure>", lambda e, t=trabajo: t.configure(wraplength=max(e.width - 16, 120)))
 
         self.consolidar_btn = BotonRedondeado(
             interior, "🧩  Consolidar 'Variaciones'", self._handle_consolidar,
-            Paleta.verde, Paleta.tarjeta, alto=38,
+            Paleta.navy, Paleta.tarjeta, alto=38,
         )
         self.consolidar_btn.pack(side=tk.BOTTOM, fill="x", pady=(8, 0))
         return marco
@@ -574,17 +623,35 @@ class ReservasGUI:
             "del Layout OT y de ahí la plantilla 'Póliza Carga Batch', el archivo que se "
             "sube a SAP. Usa el periodo para las fechas y el Period.",
         )
-        self._fila_archivo(interior, self.archivo_poliza_var, self._elegir_archivo_poliza,
-                           etiqueta="Layout OT (.xlsx)")
-        tk.Frame(interior, bg=Paleta.tarjeta, height=6).pack()
-        self._fila_archivo(interior, self.archivo_batch_var, self._elegir_plantilla_batch,
-                           etiqueta="Carga Batch (.xlsx)")
+        # Captions above the fields: a third of the window is too narrow for an inline caption.
+        self._etiqueta(interior, "Layout OT (.xlsx)")
+        self._fila_archivo(interior, self.archivo_poliza_var, self._elegir_archivo_poliza)
+        self._etiqueta(interior, "Carga Batch (.xlsx)", pady=(6, 3))
+        self._fila_archivo(interior, self.archivo_batch_var, self._elegir_plantilla_batch)
 
         self.poliza_btn = BotonRedondeado(
-            interior, "📋  Generar 'PÓLIZA SAP' + Carga Batch", self._handle_poliza,
-            Paleta.acento, Paleta.tarjeta, alto=38,
+            interior, "📋  Generar 'PÓLIZA SAP' + Carga Batch!", self._handle_poliza,
+            Paleta.navy, Paleta.tarjeta, alto=38,
         )
         self.poliza_btn.pack(side=tk.BOTTOM, fill="x", pady=(8, 0))
+        return marco
+
+    def _build_tarjeta_subida(self, parent):
+        # Compact on purpose: no description, just the file step 3 left ready and one button.
+        marco, interior = self._tarjeta(parent, "subida")
+        self.archivo_subida_var = tk.StringVar()
+        archivo = tk.Label(interior, textvariable=self.archivo_subida_var, font=(FUENTE, 9, "bold"),
+                           fg=Paleta.navy, bg=Paleta.campo, anchor="w", justify="left", padx=8,
+                           pady=6, wraplength=240)
+        archivo.pack(fill="x", pady=(8, 0))
+        # A long file name wraps to the card's width instead of being cut.
+        archivo.bind("<Configure>", lambda e, t=archivo: t.configure(wraplength=max(e.width - 16, 120)))
+
+        self.subir_btn = BotonRedondeado(
+            interior, "🚀  Subir a SAP", self._handle_subida, Paleta.navy, Paleta.tarjeta, alto=38,
+        )
+        self.subir_btn.pack(fill="x", pady=(8, 0))
+        self._actualizar_archivo_subida()
         return marco
 
     # --- footer -------------------------------------------------------
@@ -613,12 +680,6 @@ class ReservasGUI:
         self.progreso = BarraProgreso(self.progreso_marco, Paleta.fondo)
         self._pintar_punto(Paleta.verde)
 
-        self.todo_btn = BotonRedondeado(
-            pie, "⚡  Ejecutar pasos 2 y 3", self._handle_todo, Paleta.navy, Paleta.fondo,
-            fuente=(FUENTE, 11, "bold"), alto=48, ancho=270,
-        )
-        self.todo_btn.pack(side=tk.RIGHT)
-
     # --- small widgets ------------------------------------------------
     def _etiqueta(self, parent, texto, pady=(0, 3)):
         """Small caption above a field, so each picker says what it expects."""
@@ -633,12 +694,12 @@ class ReservasGUI:
             tk.Label(fila, text=etiqueta, font=(FUENTE, 8, "bold"), fg=Paleta.texto,
                      bg=Paleta.tarjeta, width=15, anchor="w").pack(side=tk.LEFT)
         tk.Entry(
-            fila, textvariable=variable, font=(FUENTE, 9), bg=Paleta.campo,
+            fila, textvariable=variable, width=10, font=(FUENTE, 9), bg=Paleta.campo,
             fg=Paleta.navy, relief=tk.FLAT, bd=0, highlightthickness=1,
             highlightbackground=Paleta.borde, highlightcolor=Paleta.navy,
         ).pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 8), ipady=5)
         BotonRedondeado(
-            fila, "Examinar...", comando, Paleta.navy, Paleta.tarjeta,
+            fila, "Examinar...", comando, Paleta.negro, Paleta.tarjeta,
             fuente=(FUENTE, 9, "bold"), alto=30, radio=8, ancho=96,
         ).pack(side=tk.LEFT)
         return fila
@@ -657,7 +718,7 @@ class ReservasGUI:
     # ------------------------------------------------------------------
     def marcar_paso(self, paso, estado):
         """
-        Set the state of one step: paso in ('traspaso', 'consolidacion', 'poliza'),
+        Set the state of one step: paso in ('traspaso', 'consolidacion', 'poliza', 'subida'),
         estado in ('pendiente', 'en_curso', 'listo', 'parcial', 'error').
         """
         if paso not in self._estado_paso:
@@ -851,6 +912,10 @@ class ReservasGUI:
         ruta = self.get_archivo()
         self.archivo_trabajo_var.set(os.path.basename(ruta) if ruta else "(elige el archivo en el paso 1)")
 
+    def _actualizar_archivo_subida(self):
+        ruta = self.get_archivo_subida()
+        self.archivo_subida_var.set(os.path.basename(ruta) if ruta else "(se llena al terminar el paso 3)")
+
     # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
@@ -866,8 +931,9 @@ class ReservasGUI:
         self._disparar(self.on_poliza, self.validate_poliza,
                        self.get_archivo_poliza)
 
-    def _handle_todo(self):
-        self._disparar(self.on_todo, self.validate_todo, self.get_archivo)
+    def _handle_subida(self):
+        self._disparar(self.on_subir, self.validate_subida,
+                       self.get_archivo_subida)
 
     def _disparar(self, callback, validador, accesor):
         """Validate, then call the controller — or say the wiring is missing."""
@@ -1000,8 +1066,16 @@ class ReservasGUI:
         self._guardar_config()
         return True
 
-    def validate_todo(self):
-        return self.validate_variaciones() and self.validate_poliza()
+    def validate_subida(self):
+        ruta = self.get_archivo_subida()
+        if not ruta:
+            messagebox.showerror(
+                "Falta la Póliza Carga Batch",
+                "Primero genera la póliza en el paso 3: el archivo que se sube a SAP es la "
+                "Póliza Carga Batch que ese paso deja lista.",
+            )
+            return False
+        return self._validar_ruta(ruta, "la Póliza Carga Batch", {".xlsx", ".xlsm"})
 
     # Kept so any older call site (or a quick test script) still works.
     def validate(self):
@@ -1018,6 +1092,15 @@ class ReservasGUI:
 
     def get_archivo_batch(self):
         return self.archivo_batch_var.get().strip()
+
+    def get_archivo_subida(self):
+        """The 'Póliza Carga Batch' step 4 would upload ('' = step 3 has not produced one)."""
+        return self.ruta_subida
+
+    def set_archivo_subida(self, ruta):
+        """Arm step 4 with the batch file step 3 just produced; None or '' disarms it."""
+        self.ruta_subida = os.path.normpath(ruta) if ruta else ""
+        self._actualizar_archivo_subida()
 
     def set_archivo(self, ruta):
         """Point the Creación de Reservas field at `ruta` (and remember it)."""
@@ -1060,7 +1143,7 @@ class ReservasGUI:
     # Button state
     # ------------------------------------------------------------------
     def _botones(self):
-        return (self.traspasar_btn, self.consolidar_btn, self.poliza_btn, self.todo_btn)
+        return (self.traspasar_btn, self.consolidar_btn, self.poliza_btn, self.subir_btn)
 
     def disable_buttons(self):
         self._ocupado = True

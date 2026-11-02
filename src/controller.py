@@ -1,10 +1,12 @@
 """RDA Pólizas D&A — controller.py: wires the GUI to the consolidation modules (confirm, run,
 summarise in a popup, always re-enable the buttons in a `finally`).
 Actions: execute_traspaso (step 1), execute_consolidacion (2), execute_poliza_sap (3: layout + batch),
-execute_todo (2 and 3 in order). The processes share no state; 'todo' calls them in sequence and keeps score.
+execute_subida_sap (4: opens the upload in SAP, no F8 yet). The processes share no state, except that step 3
+hands the batch file it produced to step 4 through the GUI.
 """
 
 import os
+from datetime import datetime
 from tkinter import messagebox
 
 from Comparativos import HOJA_COMPARATIVO_AGRUPADOR, HOJA_COMPARATIVO_BU
@@ -12,6 +14,7 @@ from Consolidacion import GRUPOS, HOJA_VARIACIONES, construir_variaciones, resol
 from Create_Poliza_Batch import fecha_contable, generar_poliza_batch
 from Create_Poliza_SAP import NOMBRES_HOJAS_LAYOUT, generar_poliza_sap
 from Reservas_Manuales import previsualizar_pegado, traspasar_templates
+from Upload_SAP import SOCIEDAD, TIPO_DOC, TRANSACCION, preparar_subida_sap
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
 
 # How many unmatched concepts to list inside the popup before trimming, so the message box never grows taller than the screen.
@@ -19,14 +22,14 @@ MAX_NO_MAPEADOS_EN_POPUP = 8
 
 
 class ReservasController:
-    """Connects the GUI with the two consolidations."""
+    """Connects the GUI with the two consolidations and the SAP upload."""
 
     def __init__(self, gui):
         self.gui = gui
         self.gui.on_traspasar  = self.execute_traspaso
         self.gui.on_consolidar = self.execute_consolidacion
         self.gui.on_poliza     = self.execute_poliza_sap
-        self.gui.on_todo       = self.execute_todo
+        self.gui.on_subir      = self.execute_subida_sap
         # The step 1 checklist lights a channel from the template FILE NAME (alphabetical order).
         self.gui.configurar_canales(sorted(g["canal"] for g in GRUPOS), self._canal_por_nombre)
 
@@ -45,9 +48,17 @@ class ReservasController:
             messagebox.showerror("Periodo de cierre inválido", str(e))
             return None
 
+    @staticmethod
+    def _fecha_archivo(ruta):
+        """Last-modified time of a file as 'dd.mm.yyyy hh:mm' ('?' if it cannot be read)."""
+        try:
+            return datetime.fromtimestamp(os.path.getmtime(ruta)).strftime("%d.%m.%Y %H:%M")
+        except OSError:
+            return "?"
+
     # --- Shared runner ---
     def _ejecutar(self, funcion):
-        """Run one consolidation -> (True, resumen) | (False, mensaje); touches no buttons or popups, so 'todo' survives a failed step."""
+        """Run one consolidation -> (True, resumen) | (False, mensaje); touches no buttons or popups."""
         try:
             return True, funcion()
 
@@ -62,7 +73,7 @@ class ReservasController:
             )
 
         except RuntimeError as e:
-            # Raised by Poliza_SAP when pywin32 / Excel are not available.
+            # Raised when pywin32 / Excel / SAP GUI are not available, or SAP refuses a step.
             return False, str(e)
 
         except Exception as e:
@@ -232,12 +243,18 @@ class ReservasController:
         if not confirm:
             return
 
+        # A new run replaces the batch file step 4 would upload: disarm it until this run succeeds.
+        self.gui.set_archivo_subida(None)
+        self.gui.marcar_paso("subida", "pendiente")
+
         self.gui.disable_buttons()
         try:
             self.gui.marcar_paso("poliza", "en_curso")
             ok, payload = self._ejecutar_poliza(ruta_libro, ruta_plantilla, mes)
             if ok and not payload["batch_error"]:
                 self.gui.marcar_paso("poliza", "listo")
+                # Step 4 uploads exactly the file this run produced.
+                self.gui.set_archivo_subida(payload["batch"]["ruta"])
                 self.gui.set_status("✅ ¡Póliza SAP completada!")
                 messagebox.showinfo(
                     "Póliza SAP completada", self._texto_poliza(payload)
@@ -258,87 +275,44 @@ class ReservasController:
         finally:
             self._finalizar()
 
-    # --- Both, in order ---
-    def execute_todo(self):
-        if not self.gui.validate_todo():
+    # --- PROCESO 3 — subida a SAP ---
+    def execute_subida_sap(self):
+        if not self.gui.validate_subida():
             return
 
-        ruta_var = self.gui.get_archivo()
-        ruta_pol = self.gui.get_archivo_poliza()
-        ruta_bat = self.gui.get_archivo_batch()
-        mes      = self.gui.get_mes()
-        claves   = self._claves_o_error(mes)
-        if claves is None:
+        ruta = self.gui.get_archivo_subida()
+        confirm = messagebox.askyesno(
+            "Confirmar subida a SAP",
+            f"¿Cargar la Póliza Carga Batch en SAP?\n\n"
+            f"  📦 Archivo  : {os.path.basename(ruta)}\n"
+            f"  🕒 Generado : {self._fecha_archivo(ruta)}\n"
+            f"  📁 Carpeta  : {os.path.dirname(ruta)}\n"
+            f"  🖥️  SAP      : transacción {TRANSACCION}\n"
+            f"  🏢 Sociedad : {SOCIEDAD} · clase de documento {TIPO_DOC}\n\n"
+            f"Se usa tu sesión de SAP abierta. Por ahora se detiene antes de\n"
+            f"ejecutar (F8): la revisas y la ejecutas tú en SAP."
+        )
+        if not confirm:
             return
-        anterior, actual = claves
 
         self.gui.disable_buttons()
         try:
-            confirm = messagebox.askyesno(
-                "Confirmar ejecución completa",
-                f"¿Correr los pasos 2 y 3?\n\n"
-                f"  2️⃣  '{HOJA_VARIACIONES}'\n"
-                f"      📄 {os.path.basename(ruta_var)}\n"
-                f"      📅 {anterior} vs {actual}\n\n"
-                f"  3️⃣  'PÓLIZA SAP' + Póliza Carga Batch\n"
-                f"      📄 {os.path.basename(ruta_pol)}\n"
-                f"      📦 {os.path.basename(ruta_bat)}\n"
-                f"      📅 Posting Date {fecha_contable(mes)}\n\n"
-                f"Ambos escriben sobre COPIAS en la subcarpeta 'Output'."
-            )
-            if not confirm:
-                return
-
-            # --- Step 2 ---------------------------------------------------
-            self.gui.marcar_paso("consolidacion", "en_curso")
-            self.gui.set_status("2️⃣  Consolidando 'Variaciones'...")
-            ok1, payload1 = self._ejecutar(lambda: construir_variaciones(
-                ruta_var, mes=mes, callback_status=self.gui.set_status,
+            self.gui.marcar_paso("subida", "en_curso")
+            ok, payload = self._ejecutar(lambda: preparar_subida_sap(
+                ruta, callback_status=self.gui.set_status,
             ))
-            self.gui.marcar_paso("consolidacion", "listo" if ok1 else "error")
-
-            if not ok1:
-                seguir = messagebox.askyesno(
-                    "Falló el paso 2",
-                    f"La consolidación de '{HOJA_VARIACIONES}' falló:\n\n"
-                    f"{payload1}\n\n"
-                    f"¿Continúo con el paso 3 ('PÓLIZA SAP')?",
+            if ok:
+                # Without F8 nothing is posted yet, so the step stays 'A medias' until a run really executes.
+                self.gui.marcar_paso("subida", "listo" if payload["ejecutado"] else "parcial")
+                self.gui.set_status(
+                    "✅ ¡Subida a SAP completada!" if payload["ejecutado"]
+                    else "⚠️ Preparación en SAP completada: falta ejecutar (F8)"
                 )
-                if not seguir:
-                    self.gui.set_status("❌ Ejecución detenida en el paso 2")
-                    return
-
-            # --- Step 3 ---------------------------------------------------
-            self.gui.marcar_paso("poliza", "en_curso")
-            self.gui.set_status("3️⃣  Generando la 'PÓLIZA SAP'...")
-            ok2, payload2 = self._ejecutar_poliza(ruta_pol, ruta_bat, mes)
-            # Step 3 counts as fully OK only if the batch file was also produced.
-            batch_fallo = ok2 and bool(payload2["batch_error"])
-            self.gui.marcar_paso(
-                "poliza", "error" if not ok2 else ("parcial" if batch_fallo else "listo"))
-
-            # --- Combined report ------------------------------------------
-            partes = []
-            partes.append(
-                f"2️⃣  {HOJA_VARIACIONES}  —  {'✅ OK' if ok1 else '❌ FALLÓ'}\n"
-                + (self._texto_variaciones(payload1) if ok1 else payload1)
-            )
-            estado2 = "❌ FALLÓ" if not ok2 else ("⚠️ A MEDIAS" if batch_fallo else "✅ OK")
-            partes.append(
-                f"3️⃣  PÓLIZA SAP + Póliza Carga Batch  —  {estado2}\n"
-                + (self._texto_poliza(payload2) if ok2 else payload2)
-            )
-            texto = ("\n" + "─" * 48 + "\n").join(partes)
-
-            if ok1 and ok2 and not batch_fallo:
-                self.gui.set_status("✅ ¡Ejecución completa completada!")
-                messagebox.showinfo("Ejecución completa", texto)
-            elif ok1 or ok2:
-                self.gui.set_status("⚠️ Ejecución completada a medias")
-                messagebox.showwarning("Ejecución parcial", texto)
+                messagebox.showinfo("Subida a SAP", self._texto_subida(payload))
             else:
-                self.gui.set_status("❌ Fallaron los dos procesos")
-                messagebox.showerror("Ejecución fallida", texto)
+                self.gui.marcar_paso("subida", "error")
+                self.gui.set_status("❌ Error preparando la subida a SAP")
+                messagebox.showerror("Error en la subida a SAP", payload)
         finally:
             self._finalizar()
 
@@ -599,4 +573,22 @@ class ReservasController:
                 f"     • {a}" for a in advertencias
             )
 
+        return texto
+
+    @staticmethod
+    def _texto_subida(resumen):
+        """Popup text of the SAP upload: what was loaded and, while F8 is not sent, that nothing is posted yet."""
+        texto = (
+            f"La transacción {resumen['transaccion']} quedó abierta en SAP con el archivo cargado:\n"
+            f"{resumen['ruta']}\n\n"
+            f"  • Sociedad / clase : {resumen['sociedad']} / {resumen['clase_documento']}\n"
+            f"  • Opción           : procesar"
+        )
+        if resumen.get("aviso_sap"):
+            texto += f"\n  • Mensaje de SAP   : {resumen['aviso_sap']}"
+        if not resumen["ejecutado"]:
+            texto += (
+                "\n\n⚠️ Todavía NO se ejecutó (F8): revisa la pantalla en SAP y ejecútala tú. "
+                "Hasta entonces no se ha subido nada."
+            )
         return texto
