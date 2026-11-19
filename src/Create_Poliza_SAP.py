@@ -16,6 +16,7 @@ from utils import cerrar_excel as _cerrar_excel
 from utils import error_de_excel as _error_de
 from utils import es_vacio_excel as _vacio
 from utils import hoja_por_nombre as _hoja
+from utils import motivo_reserva_omitida
 from utils import norm_texto as _norm
 
 # Excel COM constants as plain numbers: win32com.client.constants breaks inside a PyInstaller .exe.
@@ -424,9 +425,9 @@ def validar_catalogo(catalogo):
 
 # --- Input validation (nothing is written until this passes) ---
 def validar_entradas(seccion):
-    """Check one tab's input cells BEFORE writing: all present, free of Excel errors, RESERVA ($) a finite number.
-    A blank ID GPO CADENA still builds a valid-looking ASIGNACION, and a text amount becomes 0 via IFERROR.
-    Returns a list of problems: {'hoja', 'titulo', 'tipo', 'total', 'celdas'}."""
+    """Check one tab's input cells BEFORE writing: present, free of Excel errors, RESERVA ($) a finite number.
+    Rows whose RESERVA ($) carries no amount (0, blank, '-') are left out of the policy and not checked further.
+    Returns (problems, omitted): problems = {'hoja', 'titulo', 'tipo', 'total', 'celdas'}; omitted = {'cero': n, 'blanco': [cells], 'guion': [cells]}."""
     ws, nombre = seccion["hoja"], seccion["nombre"]
     ini, fin = seccion["fila_inicio"], seccion["fila_fin"]
     leidas = {
@@ -434,11 +435,17 @@ def validar_entradas(seccion):
         for clave in ENTRADAS
     }
 
-    grupos, filas_vacias = {}, []
+    grupos = {}
+    omitidas = {"cero": 0, "blanco": [], "guion": []}
+    letra_reserva = seccion["columnas"]["reserva"]["letra"]
     for i in range(fin - ini + 1):
         fila = ini + i
-        if all(_vacio(leidas[clave][i]) for clave in ENTRADAS):
-            filas_vacias.append(f"fila {fila}")
+        motivo = motivo_reserva_omitida(leidas["reserva"][i])
+        if motivo == "cero":
+            omitidas["cero"] += 1
+            continue
+        if motivo:
+            omitidas[motivo].append(f"{nombre}!{letra_reserva}{fila}")
             continue
         for clave in ENTRADAS:
             valor = leidas[clave][i]
@@ -466,12 +473,31 @@ def validar_entradas(seccion):
     for (titulo, tipo), celdas in grupos.items():
         problemas.append({"hoja": nombre, "titulo": titulo, "tipo": tipo,
                           "total": len(celdas), "celdas": celdas[:MAX_ERRORES_REPORTADOS]})
-    if filas_vacias:
-        problemas.append({"hoja": nombre, "titulo": "(renglón completo)",
-                          "tipo": "vacío entre los datos (bórralo)",
-                          "total": len(filas_vacias),
-                          "celdas": filas_vacias[:MAX_ERRORES_REPORTADOS]})
-    return problemas
+    return problemas, omitidas
+
+
+def _contar_omitidas(*omitidas):
+    """{'cero': n, 'blanco': n, 'guion': n} summed over one or more tabs' `omitted` dicts."""
+    return {
+        "cero":   sum(o["cero"] for o in omitidas),
+        "blanco": sum(len(o["blanco"]) for o in omitidas),
+        "guion":  sum(len(o["guion"]) for o in omitidas),
+    }
+
+
+def _avisos_omitidas(omitidas):
+    """Warnings for the rows left out because RESERVA ($) is blank or '-' (a zero is expected; these may be a forgotten amount)."""
+    avisos = []
+    for nombre, o in omitidas.items():
+        for motivo, que in (("blanco", "vacía"), ("guion", "con '-'")):
+            celdas = o[motivo]
+            if celdas:
+                resto = len(celdas) - MAX_ERRORES_REPORTADOS
+                avisos.append(
+                    f"{len(celdas)} renglón(es) con RESERVA ($) {que} NO irán a la póliza: "
+                    + ", ".join(celdas[:MAX_ERRORES_REPORTADOS]) + (f", ...y {resto} más" if resto > 0 else "")
+                )
+    return avisos
 
 
 def _texto_problemas_entradas(problemas):
@@ -595,16 +621,18 @@ def _procesar_libro(ruta, convertir_a_valores, update_status):
         catalogo = localizar_catalogo(wb)
         validar_catalogo(catalogo)
 
-        problemas = []
+        problemas, omitidas = [], {}
         for s in secciones:
             if bool(s["hoja"].ProtectContents):
                 raise ValueError(
                     f"La pestaña '{s['nombre']}' está protegida: no puedo escribir en "
                     f"ella.\n\nQuítale la protección y vuelve a intentar."
                 )
-            problemas += validar_entradas(s)
+            problemas_hoja, omitidas[s["nombre"]] = validar_entradas(s)
+            problemas += problemas_hoja
         if problemas:
             raise ValueError(_texto_problemas_entradas(problemas))
+        avisos += _avisos_omitidas(omitidas)
 
         for s in secciones:
             update_status(
@@ -696,6 +724,7 @@ def _procesar_libro(ruta, convertir_a_valores, update_status):
                 "fila_inicio":     s["fila_inicio"],
                 "fila_fin":        s["fila_fin"],
                 "filas":           s["filas"],
+                "omitidas":        _contar_omitidas(omitidas[s["nombre"]]),
                 "total_control":   round(total_hoja, 2),
                 "columnas":        [
                     f"{s['columnas'][spec['clave']]['letra']} — {spec['encabezado']}"
@@ -734,6 +763,7 @@ def _procesar_libro(ruta, convertir_a_valores, update_status):
             "filas":                sum(s["filas"] for s in secciones),
             "columnas":             hojas_resumen[0]["columnas"],
             "total_control":        round(total_control, 2),
+            "omitidas":             _contar_omitidas(*omitidas.values()),
             "columna_control":      titulo_de(CLAVE_MONTO),
             "errores":              errores,
             "total_errores":        total_errores,

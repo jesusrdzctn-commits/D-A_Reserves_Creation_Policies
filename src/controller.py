@@ -1,6 +1,6 @@
 """RDA Pólizas D&A — controller.py: wires the GUI to the consolidation modules (confirm, run,
 summarise in a popup, always re-enable the buttons in a `finally`).
-Actions: execute_traspaso (step 1), execute_consolidacion (2), execute_poliza_sap (3: layout + batch),
+Actions: execute_traspaso (step 1), execute_consolidacion (2), execute_poliza_sap (3: 'PÓLIZA SAP' of every template + ONE batch),
 execute_subida_sap (4: opens the upload in SAP, no F8 yet). The processes share no state, except that step 3
 hands the batch file it produced to step 4 through the GUI.
 """
@@ -79,23 +79,36 @@ class ReservasController:
         except Exception as e:
             return False, f"Ocurrió un error inesperado:\n\n{e}"
 
-    def _ejecutar_poliza(self, ruta_layout, ruta_plantilla, mes=None):
-        """Process 2 end to end: layout 'PÓLIZA SAP', then 'Póliza Carga Batch'. (True, resumen) when the layout worked
-        (resumen['batch'] / ['batch_error'] carry the batch outcome), (False, mensaje) otherwise."""
-        ok, resumen = self._ejecutar(lambda: generar_poliza_sap(
-            ruta_layout, callback_status=self.gui.set_status,
+    def _poliza_de_layout(self, ruta, k, total):
+        """'PÓLIZA SAP' of template number k of `total`; its status lines carry the (k/total) counter."""
+        return self._ejecutar(lambda: generar_poliza_sap(
+            ruta, callback_status=lambda m: self.gui.set_status(f"({k}/{total}) {m}"),
         ))
-        if not ok:
-            return False, resumen
 
-        self.gui.set_status("📦 Llenando la 'Póliza Carga Batch'...")
-        # resumen['ruta'] is the processed copy in 'Output': the batch reads it and lands there too.
+    def _ejecutar_poliza(self, templates, ruta_plantilla, mes=None):
+        """Step 3 end to end: 'PÓLIZA SAP' of EVERY template, then ONE 'Póliza Carga Batch' from all of them.
+        (True, {'layouts', 'batch', 'batch_error'}) when every layout worked, (False, mensaje) when one did not
+        (the batch is not attempted: a policy without that channel would be silently incomplete)."""
+        layouts = []
+        total = len(templates)
+        for i, ruta in enumerate(templates, start=1):
+            nombre = os.path.basename(ruta)
+            ok, resumen = self._poliza_de_layout(ruta, i, total)
+            if not ok:
+                hechos = f"\n\n({len(layouts)} template(s) anterior(es) sí quedaron listos en 'Output'.)" if layouts else ""
+                return False, f"No se pudo llenar la 'PÓLIZA SAP' de '{nombre}':\n\n{resumen}{hechos}"
+            layouts.append(resumen)
+
+        self.gui.set_status("📦 Armando la 'Póliza Carga Batch' de todos los canales...")
+        # Each resumen['ruta'] is the processed copy in 'Output': the batch reads them and lands there too.
         ok_batch, payload_batch = self._ejecutar(lambda: generar_poliza_batch(
-            resumen["ruta"], ruta_plantilla, callback_status=self.gui.set_status, mes=mes,
+            [r["ruta"] for r in layouts], ruta_plantilla, callback_status=self.gui.set_status, mes=mes,
         ))
-        resumen["batch"]       = payload_batch if ok_batch else None
-        resumen["batch_error"] = None if ok_batch else payload_batch
-        return True, resumen
+        return True, {
+            "layouts":     layouts,
+            "batch":       payload_batch if ok_batch else None,
+            "batch_error": None if ok_batch else payload_batch,
+        }
 
     def _finalizar(self):
         """Re-enable the buttons and reset the status line if nothing succeeded."""
@@ -215,11 +228,25 @@ class ReservasController:
             self._finalizar()
 
     # --- PROCESO 2 — sección 'PÓLIZA SAP' ---
+    @staticmethod
+    def _canales_de_templates(templates):
+        """([(template name, channel hint or None)], {channel: [names]} for any channel hinted twice, [channels not hinted]).
+        Hints come from the FILE NAMES only; the batch step reads the real channel from the tab titles too.
+        A list, not a dict: two templates may share a name when they live in different folders."""
+        pistas = [(os.path.basename(r), ReservasController._canal_por_nombre(r)) for r in templates]
+        por_canal = {}
+        for nombre, canal in pistas:
+            if canal:
+                por_canal.setdefault(canal, []).append(nombre)
+        repetidos = {c: ns for c, ns in por_canal.items() if len(ns) > 1}
+        faltantes = [g["canal"] for g in GRUPOS if g["canal"] not in por_canal]
+        return pistas, repetidos, faltantes
+
     def execute_poliza_sap(self):
         if not self.gui.validate_poliza():
             return
 
-        ruta_libro     = self.gui.get_archivo_poliza()
+        templates      = self.gui.get_templates()
         ruta_plantilla = self.gui.get_archivo_batch()
         mes            = self.gui.get_mes()
         claves         = self._claves_o_error(mes)
@@ -227,16 +254,33 @@ class ReservasController:
             return
         actual = claves[1]
 
+        pistas, repetidos, faltantes = self._canales_de_templates(templates)
+        if repetidos:
+            detalle = "\n".join(f"  • {canal}: {', '.join(ns)}" for canal, ns in repetidos.items())
+            messagebox.showerror(
+                "Canal repetido",
+                f"Hay más de un template del mismo canal (la póliza lleva uno por canal):\n\n{detalle}\n\n"
+                f"Quita el que sobre en la tarjeta 1.",
+            )
+            return
+
+        lista = "\n".join(f"     • {n}  →  {c or 'canal por su título'}" for n, c in pistas)
+        # Warn, never block: a month without one channel is legitimate. Only claimed when every name gave its channel.
+        falta = ""
+        if faltantes and all(c for _, c in pistas):
+            falta = f"\n⚠️ Sin template de: {', '.join(faltantes)}. La póliza saldrá SIN esos canales.\n"
+
         confirm = messagebox.askyesno(
             "Confirmar póliza SAP",
-            f"¿Llenar la sección 'PÓLIZA SAP' y la Póliza Carga Batch?\n\n"
-            f"  📄 Layout  : {os.path.basename(ruta_libro)}\n"
+            f"¿Llenar 'PÓLIZA SAP' en los templates y armar UNA Póliza Carga Batch?\n\n"
+            f"  📄 Templates ({len(templates)}):\n{lista}\n"
             f"  📑 Pestañas: {' + '.join(NOMBRES_HOJAS_LAYOUT)}\n"
-            f"  ✍️  Sección : 'PÓLIZA SAP' de cada pestaña\n"
+            f"  🚫 Se dejan fuera los renglones con RESERVA ($) en 0, en blanco o en '-'\n"
             f"  📦 Plantilla: {os.path.basename(ruta_plantilla)}\n"
-            f"     (se llena con los valores de la póliza)\n"
+            f"  📊 Incluye la hoja 'Validación - Cifras Control' (2 tablas dinámicas)\n"
             f"  📅 Cierre   : {actual} ({etiqueta_mes_es(actual)})\n"
-            f"     Posting Date {fecha_contable(mes)}, Period {int(actual[1:3])}\n\n"
+            f"     Posting Date {fecha_contable(mes)}, Period {int(actual[1:3])}\n"
+            f"{falta}\n"
             f"Se abrirá Excel en segundo plano y se trabajará sobre COPIAS\n"
             f"en la subcarpeta 'Output'. Los originales no se tocan."
         )
@@ -250,7 +294,7 @@ class ReservasController:
         self.gui.disable_buttons()
         try:
             self.gui.marcar_paso("poliza", "en_curso")
-            ok, payload = self._ejecutar_poliza(ruta_libro, ruta_plantilla, mes)
+            ok, payload = self._ejecutar_poliza(templates, ruta_plantilla, mes)
             if ok and not payload["batch_error"]:
                 self.gui.marcar_paso("poliza", "listo")
                 # Step 4 uploads exactly the file this run produced.
@@ -260,7 +304,7 @@ class ReservasController:
                     "Póliza SAP completada", self._texto_poliza(payload)
                 )
             elif ok:
-                # Layout done and saved; only the batch step failed.
+                # The layouts are done and saved; only the batch step failed.
                 self.gui.marcar_paso("poliza", "parcial")
                 self.gui.set_status(
                     "⚠️ Póliza SAP completada, pero la Póliza Carga Batch falló"
@@ -474,36 +518,37 @@ class ReservasController:
         return texto
 
     @staticmethod
-    def _texto_poliza(resumen):
-        """Build the 'PÓLIZA SAP' popup text. The #N/A warning is the important half: those rows go up to SAP,
+    def _texto_poliza(payload):
+        """Build the step 3 popup text. The #N/A warning is the important half: those rows go up to SAP,
         so an unknown account, cost centre or description in 'Catalogo' must be fixed BEFORE the upload."""
-        columnas = "\n".join(f"     • {c}" for c in resumen["columnas"])
-        hojas = "\n".join(
-            f"     • {h['hoja']}: {h['filas']:,} renglón(es) "
-            f"(filas {h['fila_inicio']}–{h['fila_fin']}), Σ {h['total_control']:,.2f}"
-            for h in resumen["hojas"]
-        )
+        layouts = payload["layouts"]
+        lineas = []
+        for lay in layouts:
+            o = lay.get("omitidas") or {}
+            fuera = sum(o.values())
+            lineas.append(
+                f"     • {os.path.basename(lay['ruta'])}: {lay['filas']:,} renglón(es), "
+                f"Σ {lay['columna_control']} {lay['total_control']:,.2f}"
+                + (f" · {fuera:,} sin importe" if fuera else "")
+            )
 
         texto = (
-            f"Archivo generado:\n{resumen['ruta']}\n\n"
-            f"  • Pestañas         :\n{hojas}\n"
-            f"  • Renglones        : {resumen['filas']:,}\n"
-            f"  • Columnas         :\n{columnas}\n"
-            f"  • Σ {resumen['columna_control']} (todas las pestañas) : "
-            f"{resumen['total_control']:,.2f}\n"
+            f"'PÓLIZA SAP' llenada en {len(layouts)} template(s) (copias en 'Output'):\n"
+            + "\n".join(lineas) + "\n"
         )
 
-        errores = resumen.get("errores") or []
+        errores = [(os.path.basename(lay["ruta"]), e) for lay in layouts for e in lay.get("errores") or []]
         if errores:
+            total = sum(lay.get("total_errores", 0) for lay in layouts)
             texto += (
-                f"\n\n⚠️ {resumen['total_errores']} celda(s) con error en los "
+                f"\n\n⚠️ {total} celda(s) con error en los "
                 f"VLOOKUP — hay que corregirlas ANTES de subir a SAP:\n"
             )
-            for e in errores:
+            for archivo, e in errores:
                 celdas = ", ".join(f"{c['celda']} {c['error']}" for c in e["celdas"])
                 resto = e["total"] - len(e["celdas"])
                 texto += (
-                    f"     • {e['hoja']} — {e['columna']} ({e['titulo']}): "
+                    f"     • {archivo} — {e['hoja']} — {e['columna']} ({e['titulo']}): "
                     f"{e['total']} error(es)\n"
                     f"       {celdas}"
                     + (f", ...y {resto} más" if resto > 0 else "")
@@ -516,11 +561,11 @@ class ReservasController:
         else:
             texto += "\n\n✅ Sin errores: todos los VLOOKUP empataron."
 
-        avisos = resumen.get("advertencias") or []
+        avisos = [(os.path.basename(lay["ruta"]), a) for lay in layouts for a in lay.get("advertencias") or []]
         if avisos:
-            texto += "\n\nℹ️ Avisos:\n" + "\n".join(f"     • {a}" for a in avisos)
+            texto += "\n\nℹ️ Avisos:\n" + "\n".join(f"     • {archivo}: {a}" for archivo, a in avisos)
 
-        texto += ReservasController._texto_batch(resumen)
+        texto += ReservasController._texto_batch(payload)
 
         return texto
 
@@ -538,27 +583,35 @@ class ReservasController:
         )
 
     @staticmethod
-    def _texto_batch(resumen):
+    def _texto_batch(payload):
         """'Póliza Carga Batch' half of the popup: produced (with its warnings) or not.
-        Not producing it is no error dialog (the layout is already saved) but must not be silent."""
-        error = resumen.get("batch_error")
+        Not producing it is no error dialog (the layouts are already saved) but must not be silent."""
+        error = payload.get("batch_error")
         if error:
             return (
                 f"\n\n❌ La Póliza Carga Batch NO se generó:\n\n{error}\n\n"
-                f"La 'PÓLIZA SAP' del Layout sí quedó lista en el archivo de arriba."
+                f"La 'PÓLIZA SAP' de los templates sí quedó lista en los archivos de arriba."
             )
 
-        batch = resumen.get("batch")
+        batch = payload.get("batch")
         if not batch:
             return ""
 
         d_ini, d_fin = batch["bloque_debito"]
         c_ini, c_fin = batch["bloque_credito"]
-        origen = " + ".join(f"{h['hoja']} {h['filas']}" for h in batch["hojas_origen"])
+        por_canal = {}
+        for h in batch["hojas_origen"]:
+            por_canal[h["canal"]] = por_canal.get(h["canal"], 0) + h["filas"]
+        origen = " · ".join(f"{canal} {filas:,}" for canal, filas in por_canal.items())
+        o = batch["omitidas"]
+        fuera = (f"{o['total']:,} sin importe fuera ({o['cero']:,} en 0, {o['blanco']:,} en blanco, "
+                 f"{o['guion']:,} con '-', {o['redondeo']:,} por redondeo)")
+
         texto = (
-            f"\n\n📦 Póliza Carga Batch generada:\n{batch['ruta']}\n\n"
+            f"\n\n📦 Póliza Carga Batch generada (una sola, todos los canales):\n{batch['ruta']}\n\n"
             f"  • Pestaña          : {batch['hoja']}\n"
-            f"  • Origen (Layout)  : {origen}\n"
+            f"  • Canales / filas  : {origen}\n"
+            f"  • Renglones        : {batch['filas_leidas']:,} leídos → {batch['filas_origen']:,} en la póliza; {fuera}\n"
             f"  • Bloque débito    : filas {d_ini}–{d_fin} ({batch['filas_origen']:,})\n"
             f"  • Bloque crédito   : filas {c_ini}–{c_fin} ({batch['filas_origen']:,})\n"
             f"  • Σ Debit Amount   : {batch['total_debito']:,.2f}\n"
@@ -566,6 +619,13 @@ class ReservasController:
             f"{ReservasController._texto_naranjas(batch)}\n"
             f"  ✅ Verificado: lo pegado y los campos fijos se leyeron de vuelta y coinciden."
         )
+
+        cifras = batch.get("cifras_control")
+        if cifras:
+            texto += (
+                f"\n  📊 '{cifras['hoja']}': {len(cifras['pivotes'])} tablas dinámicas, "
+                f"leídas de vuelta y cuadradas con la póliza."
+            )
 
         advertencias = batch.get("advertencias") or []
         if advertencias:

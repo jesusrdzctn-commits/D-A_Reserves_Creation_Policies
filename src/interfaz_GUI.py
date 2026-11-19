@@ -9,9 +9,9 @@ top to bottom, the way the stakeholder runs them every month:
                              'Reservas Manuales' + 'Reservas Rentas') -> 'Base'
                              of a COPY of the Creación de Reservas workbook
     2  Consolidar Variaciones  pestaña 'Variaciones' + tablas dinámicas, on that copy
-    3  Generar Póliza SAP    Layout OT (.xlsx, tabs 'Reservas Manuales' + 'Reservas Rentas')
-                             -> sección 'PÓLIZA SAP' of each tab
-                             + plantilla 'Póliza Carga Batch' (.xlsx), the file SAP gets
+    3  Generar Póliza SAP    the SAME templates as step 1 -> sección 'PÓLIZA SAP' of each tab,
+                             then ONE plantilla 'Póliza Carga Batch' (.xlsx) for all channels,
+                             the file SAP gets
     4  Subir a SAP           opens the upload transaction in SAP GUI and loads the 'Póliza Carga
                              Batch' that step 3 generated (it does not execute it yet)
 
@@ -43,8 +43,6 @@ from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
 # Which extensions each picker offers. The OT layout is a plain .xlsx, like the
 # rest of the files (the old WHSL layout was a binary .xlsb).
 FILTRO_VARIACIONES = [("Libros de Excel", "*.xlsx *.xlsm"),
-                      ("Todos los archivos", "*.*")]
-FILTRO_POLIZA      = [("Libros de Excel", "*.xlsx *.xlsm"),
                       ("Todos los archivos", "*.*")]
 # The 'Póliza Carga Batch' template is a plain .xlsx (the file SAP receives).
 FILTRO_BATCH       = [("Libros de Excel", "*.xlsx *.xlsm"),
@@ -276,7 +274,7 @@ class BarraProgreso(tk.Canvas):
 class ReservasGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Robotic Desktop Automation Pólizas D&A")
+        self.root.title("Robotic Desktop Automation — Pólizas D&A")
         self.root.configure(bg=Paleta.fondo)
         self._ajustar_ventana()
 
@@ -296,9 +294,7 @@ class ReservasGUI:
             value=(cfg.get("ultimo_archivo_variaciones")
                    or cfg.get("ultimo_archivo") or "").strip()
         )
-        self.archivo_poliza_var = tk.StringVar(
-            value=(cfg.get("ultimo_archivo_poliza") or "").strip()
-        )
+        self.poliza_templates_var = tk.StringVar()
         # Empty 'Póliza Carga Batch' template that step 3 fills at the end.
         self.archivo_batch_var = tk.StringVar(
             value=(cfg.get("ultimo_archivo_batch") or "").strip()
@@ -380,7 +376,6 @@ class ReservasGUI:
                 json.dump(
                     {
                         "ultimo_archivo_variaciones": self.archivo_var.get().strip(),
-                        "ultimo_archivo_poliza": self.archivo_poliza_var.get().strip(),
                         "ultimo_archivo_batch": self.archivo_batch_var.get().strip(),
                         # Only the folder: the templates themselves change every month.
                         "ultima_carpeta_templates": self.carpeta_templates,
@@ -619,13 +614,18 @@ class ReservasGUI:
     def _build_tarjeta_poliza(self, parent):
         marco, interior = self._tarjeta(
             parent, "poliza",
-            "Llena 'PÓLIZA SAP' en las pestañas 'Reservas Manuales' y 'Reservas Rentas' "
-            "del Layout OT y de ahí la plantilla 'Póliza Carga Batch', el archivo que se "
-            "sube a SAP. Usa el periodo para las fechas y el Period.",
+            "Llena 'PÓLIZA SAP' en los templates de la tarjeta 1 y arma UNA sola plantilla "
+            "'Póliza Carga Batch' con los cinco canales, el archivo que "
+            "se sube a SAP, más la hoja de cifras control.",
         )
         # Captions above the fields: a third of the window is too narrow for an inline caption.
-        self._etiqueta(interior, "Layout OT (.xlsx)")
-        self._fila_archivo(interior, self.archivo_poliza_var, self._elegir_archivo_poliza)
+        # Step 3 works on the templates chosen in step 1; this line tells the person how many.
+        self._etiqueta(interior, "Templates (los de la tarjeta 1):")
+        resumen = tk.Label(interior, textvariable=self.poliza_templates_var, font=(FUENTE, 9, "bold"),
+                           fg=Paleta.navy, bg=Paleta.campo, anchor="w", justify="left", padx=8,
+                           pady=6, wraplength=240)
+        resumen.pack(fill="x")
+        resumen.bind("<Configure>", lambda e, t=resumen: t.configure(wraplength=max(e.width - 16, 120)))
         self._etiqueta(interior, "Carga Batch (.xlsx)", pady=(6, 3))
         self._fila_archivo(interior, self.archivo_batch_var, self._elegir_plantilla_batch)
 
@@ -784,13 +784,6 @@ class ReservasGUI:
             FILTRO_VARIACIONES,
         )
 
-    def _elegir_archivo_poliza(self):
-        self._elegir(
-            self.archivo_poliza_var,
-            "Selecciona el Layout OT (Reservas Manuales / Reservas Rentas)",
-            FILTRO_POLIZA,
-        )
-
     def _elegir_plantilla_batch(self):
         self._elegir(
             self.archivo_batch_var,
@@ -894,6 +887,9 @@ class ReservasGUI:
             if self._detector_canal and faltan and not sin_canal:
                 resumen += f" Faltan: {', '.join(faltan)}."
         self.templates_resumen_var.set(resumen)
+        self.poliza_templates_var.set(
+            f"{n} template(s) de la tarjeta 1" if n else "(agrega los templates en la tarjeta 1)"
+        )
 
     def _actualizar_preview_mes(self):
         """Live hint of which two months the run will compare."""
@@ -929,7 +925,7 @@ class ReservasGUI:
 
     def _handle_poliza(self):
         self._disparar(self.on_poliza, self.validate_poliza,
-                       self.get_archivo_poliza)
+                       self.get_templates)
 
     def _handle_subida(self):
         self._disparar(self.on_subir, self.validate_subida,
@@ -1001,20 +997,15 @@ class ReservasGUI:
         self._guardar_config()
         return True
 
-    def validate_traspaso(self):
-        if not self._validar_archivo_y_mes():
-            return False
-
+    def _validar_templates(self, aviso_vacio, excluidos=()):
+        """Checks shared by steps 1 and 3 over the templates list: at least one, each exists and is a workbook,
+        none is Excel's '~$' lock file, none is one of `excluidos` (files that must not be fed to itself)."""
         templates = self.get_templates()
         if not templates:
-            messagebox.showerror(
-                "Faltan los templates",
-                "Agrega los templates RESERVAS MANUALES del mes con el botón "
-                "'Agregar...'.",
-            )
+            messagebox.showerror("Faltan los templates", aviso_vacio)
             return False
 
-        principal = self._clave_ruta(self.get_archivo())
+        prohibidos = {self._clave_ruta(r) for r in excluidos if r}
         for ruta in templates:
             if not self._validar_ruta(ruta, "un template RESERVAS MANUALES",
                                       {".xlsx", ".xlsm"}):
@@ -1029,24 +1020,30 @@ class ReservasGUI:
                     f"template de verdad.",
                 )
                 return False
-            # The same file as the workbook being filled would paste a file into itself.
-            if self._clave_ruta(ruta) == principal:
+            if self._clave_ruta(ruta) in prohibidos:
                 messagebox.showerror(
                     "Mismo archivo",
-                    "Uno de los templates es el mismo archivo que el de Creación de "
-                    "Reservas.\n\nQuítalo de la lista de templates.",
+                    f"'{os.path.basename(ruta)}' es el mismo archivo que otro de los que se "
+                    f"eligieron para este paso (el libro de Creación de Reservas o la plantilla "
+                    f"de Póliza Carga Batch).\n\nQuítalo de la lista de templates o elige "
+                    f"otro archivo.",
                 )
                 return False
+        return True
+
+    def validate_traspaso(self):
+        if not self._validar_archivo_y_mes():
+            return False
+        if not self._validar_templates(
+            "Agrega los templates RESERVAS MANUALES del mes con el botón 'Agregar...'.",
+            excluidos=[self.get_archivo()],
+        ):
+            return False
         self._guardar_config()
         return True
 
     def validate_poliza(self):
         if not self._validar_mes():
-            return False
-        if not self._validar_ruta(
-            self.get_archivo_poliza(), "Layout OT",
-            {".xlsx", ".xlsm"}
-        ):
             return False
         # Step 3 ends by filling the batch template, so it is mandatory.
         if not self._validar_ruta(
@@ -1054,14 +1051,12 @@ class ReservasGUI:
             {".xlsx", ".xlsm"}
         ):
             return False
-        # Same file in both pickers would make the run overwrite its own input.
-        if os.path.normcase(os.path.abspath(self.get_archivo_poliza())) == \
-                os.path.normcase(os.path.abspath(self.get_archivo_batch())):
-            messagebox.showerror(
-                "Mismo archivo",
-                "El Layout y la plantilla de Póliza Carga Batch son el mismo "
-                "archivo.\n\nElige cada uno con su botón 'Examinar...'.",
-            )
+        # The templates are the ones of step 1; the batch template among them would overwrite its own input.
+        if not self._validar_templates(
+            "Agrega los templates RESERVAS MANUALES del mes en la tarjeta 1 (botón 'Agregar...'): "
+            "el paso 3 llena la 'PÓLIZA SAP' de cada uno.",
+            excluidos=[self.get_archivo_batch()],
+        ):
             return False
         self._guardar_config()
         return True
@@ -1086,9 +1081,6 @@ class ReservasGUI:
     # ------------------------------------------------------------------
     def get_archivo(self):
         return self.archivo_var.get().strip()
-
-    def get_archivo_poliza(self):
-        return self.archivo_poliza_var.get().strip()
 
     def get_archivo_batch(self):
         return self.archivo_batch_var.get().strip()

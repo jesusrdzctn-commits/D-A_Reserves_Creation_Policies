@@ -128,6 +128,25 @@ def es_vacio_excel(valor):
     return valor is None or (isinstance(valor, str) and not valor.strip())
 
 
+# Dash-like characters an accounting format may leave in a cell that holds no amount.
+GUIONES_EXCEL = frozenset("-\u2010\u2011\u2012\u2013\u2014\u2015\u2212")
+
+
+def motivo_reserva_omitida(valor):
+    """Why a RESERVA ($) cell carries no amount ('blanco', 'guion' or 'cero'), or None when it has one.
+    Such rows are left out of the policy; an Excel error or any other text is NOT omittable (it must be fixed)."""
+    if isinstance(valor, bool):
+        return None
+    if es_vacio_excel(valor):
+        return "blanco"
+    if isinstance(valor, str):
+        texto = valor.strip()
+        return "guion" if texto and all(c in GUIONES_EXCEL for c in texto) else None
+    if isinstance(valor, (int, float)) and valor == 0:
+        return "cero"
+    return None
+
+
 def abrir_excel():
     """Start a PRIVATE Excel instance and return (app, pythoncom).
     DispatchEx, not Dispatch: Dispatch would attach to the user's open Excel and
