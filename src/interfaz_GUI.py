@@ -283,6 +283,8 @@ class ReservasGUI:
         self.on_consolidar = None   # archivo 1 -> 'Variaciones'
         self.on_poliza     = None   # archivo 2 -> 'PÓLIZA SAP'
         self.on_subir      = None   # Carga Batch -> SAP (opens the transaction, no F8 yet)
+        self.on_enviar_correos = None   # 'Variaciones' -> one e-mail per channel (step 2, after consolidating)
+        self.on_destinatarios  = None   # opens the recipients window (step 2)
 
         self._config_file = _ruta_config()
         cfg = self._cargar_config()
@@ -593,7 +595,8 @@ class ReservasGUI:
         marco, interior = self._tarjeta(
             parent, "consolidacion",
             "Arma 'Variaciones' (5 matrices por canal, mes anterior vs actual) y las dos "
-            "tablas dinámicas. Necesita Excel instalado.",
+            "tablas dinámicas. Necesita Excel instalado. Después puedes mandar las variaciones "
+            "por correo a cada stakeholder.",
         )
         self._etiqueta(interior, "Trabajará sobre (copia del paso 1):")
         self.archivo_trabajo_var = tk.StringVar()
@@ -604,6 +607,17 @@ class ReservasGUI:
         # The file name wraps to the card's width (a third of the window), never wider than it.
         trabajo.bind("<Configure>", lambda e, t=trabajo: t.configure(wraplength=max(e.width - 16, 120)))
 
+        # Packed bottom-up: the e-mail buttons sit under the main one.
+        self.destinatarios_btn = BotonRedondeado(
+            interior, "👥  Destinatarios de los correos", self._handle_destinatarios,
+            Paleta.navy_suave, Paleta.tarjeta, alto=30, fuente=(FUENTE, 9, "bold"),
+        )
+        self.destinatarios_btn.pack(side=tk.BOTTOM, fill="x", pady=(6, 0))
+        self.correos_btn = BotonRedondeado(
+            interior, "✉️  Enviar variaciones por correo", self._handle_enviar_correos,
+            Paleta.navy_suave, Paleta.tarjeta, alto=30, fuente=(FUENTE, 9, "bold"),
+        )
+        self.correos_btn.pack(side=tk.BOTTOM, fill="x", pady=(6, 0))
         self.consolidar_btn = BotonRedondeado(
             interior, "🧩  Consolidar 'Variaciones'", self._handle_consolidar,
             Paleta.navy, Paleta.tarjeta, alto=38,
@@ -923,6 +937,18 @@ class ReservasGUI:
         self._disparar(self.on_consolidar, self.validate_variaciones,
                        self.get_archivo)
 
+    def _handle_enviar_correos(self):
+        if self.on_enviar_correos:
+            self.on_enviar_correos()
+        else:
+            messagebox.showinfo("Info", "Funcionalidad no conectada")
+
+    def _handle_destinatarios(self):
+        if self.on_destinatarios:
+            self.on_destinatarios()
+        else:
+            messagebox.showinfo("Info", "Funcionalidad no conectada")
+
     def _handle_poliza(self):
         self._disparar(self.on_poliza, self.validate_poliza,
                        self.get_templates)
@@ -1132,10 +1158,84 @@ class ReservasGUI:
         self.root.update_idletasks()
 
     # ------------------------------------------------------------------
+    # Recipients window (the addresses are confidential: the controller stores them, never this file)
+    # ------------------------------------------------------------------
+    def editar_destinatarios(self, canales, actuales, guardar, ubicacion=""):
+        """Modal window: one 'Para' and one 'CC' field per channel. `canales` = [(key, title)], `actuales` = {key: {'para': [..],
+        'cc': [..]}}. `guardar(datos)` validates and saves, returns the clean dict or raises ValueError (shown, window stays open).
+        Returns the saved dict, or None if the window was cancelled."""
+        ventana = tk.Toplevel(self.root)
+        ventana.title("Destinatarios de las variaciones")
+        ventana.configure(bg=Paleta.tarjeta, padx=18, pady=14)
+        ventana.transient(self.root)
+        ventana.resizable(False, False)
+
+        tk.Label(ventana, text="¿Quién recibe el correo de cada canal?", font=(FUENTE, 11, "bold"),
+                 fg=Paleta.texto, bg=Paleta.tarjeta, anchor="w").pack(fill="x")
+        tk.Label(ventana, text="Separa varios correos con ';'. Un canal sin 'Para' no recibe correo.",
+                 font=(FUENTE, 9), fg=Paleta.suave, bg=Paleta.tarjeta, anchor="w").pack(fill="x", pady=(2, 8))
+
+        cuadro = tk.Frame(ventana, bg=Paleta.tarjeta)
+        cuadro.pack(fill="x")
+        for columna, texto in enumerate(("Canal", "Para", "CC (opcional)")):
+            tk.Label(cuadro, text=texto, font=(FUENTE, 8, "bold"), fg=Paleta.texto, bg=Paleta.tarjeta,
+                     anchor="w").grid(row=0, column=columna, sticky="w", padx=(0, 8), pady=(0, 3))
+
+        variables = {}
+        for fila, (canal, titulo) in enumerate(canales, start=1):
+            actual = actuales.get(canal, {})
+            para = tk.StringVar(value="; ".join(actual.get("para", [])))
+            cc = tk.StringVar(value="; ".join(actual.get("cc", [])))
+            variables[canal] = (para, cc)
+            tk.Label(cuadro, text=titulo, font=(FUENTE, 9, "bold"), fg=Paleta.navy, bg=Paleta.tarjeta,
+                     anchor="w").grid(row=fila, column=0, sticky="w", padx=(0, 10), pady=3)
+            for columna, variable in ((1, para), (2, cc)):
+                tk.Entry(
+                    cuadro, textvariable=variable, width=34, font=(FUENTE, 9), bg=Paleta.campo,
+                    fg=Paleta.navy, relief=tk.FLAT, bd=0, highlightthickness=1,
+                    highlightbackground=Paleta.borde, highlightcolor=Paleta.navy,
+                ).grid(row=fila, column=columna, sticky="ew", padx=(0, 8), pady=3, ipady=4)
+
+        nota = ("Se guardan solo en este equipo" + (f" ({ubicacion})" if ubicacion else "")
+                + ": no van en el código ni en config.json.")
+        tk.Label(ventana, text=nota, font=(FUENTE, 8), fg=Paleta.suave, bg=Paleta.tarjeta, anchor="w",
+                 justify="left", wraplength=620).pack(fill="x", pady=(10, 0))
+
+        resultado = {"datos": None}
+
+        def _guardar():
+            datos = {canal: {"para": para.get(), "cc": cc.get()} for canal, (para, cc) in variables.items()}
+            try:
+                resultado["datos"] = guardar(datos)
+            except ValueError as e:
+                messagebox.showerror("Revisa los correos", str(e), parent=ventana)
+                return
+            ventana.destroy()
+
+        botones = tk.Frame(ventana, bg=Paleta.tarjeta)
+        botones.pack(fill="x", pady=(12, 0))
+        BotonRedondeado(botones, "Guardar", _guardar, Paleta.navy, Paleta.tarjeta, alto=34,
+                        ancho=110).pack(side=tk.RIGHT)
+        BotonRedondeado(botones, "Cancelar", ventana.destroy, Paleta.negro, Paleta.tarjeta, alto=34,
+                        ancho=110).pack(side=tk.RIGHT, padx=(0, 8))
+        ventana.bind("<Escape>", lambda _e: ventana.destroy())
+
+        # Centered over the main window, modal until closed.
+        ventana.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - ventana.winfo_reqwidth()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - ventana.winfo_reqheight()) // 3)
+        ventana.geometry(f"+{x}+{y}")
+        ventana.grab_set()
+        ventana.focus_set()
+        self.root.wait_window(ventana)
+        return resultado["datos"]
+
+    # ------------------------------------------------------------------
     # Button state
     # ------------------------------------------------------------------
     def _botones(self):
-        return (self.traspasar_btn, self.consolidar_btn, self.poliza_btn, self.subir_btn)
+        return (self.traspasar_btn, self.consolidar_btn, self.correos_btn, self.destinatarios_btn,
+                self.poliza_btn, self.subir_btn)
 
     def disable_buttons(self):
         self._ocupado = True

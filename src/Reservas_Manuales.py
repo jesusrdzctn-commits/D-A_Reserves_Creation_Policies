@@ -69,6 +69,7 @@ MAPEO_COLUMNAS = (
 COL_BASE_CANAL = COL_CANAL
 
 # Template columns a data row cannot do without. Anything else may be blank.
+# A blank RESERVA ($) is not an error: that row is skipped and reported (see _leer_hoja).
 OBLIGATORIAS_TEMPLATE = ("MES", "AGRUPADOR ABIERTO", "RESERVA ($)")
 
 # Month key the templates must carry: the month being run. Set True only to
@@ -389,25 +390,21 @@ def _leer_hoja(ws, etiqueta, fila_enc, columnas, canal, indice_grupo, grupos):
         if all(_es_vacio(v) for v in leidos.values()):
             continue  # a really empty row
 
-        if ws.row_dimensions[n].hidden:
-            ocultas.append(n)
-
-        # --- required cells -------------------------------------
-        faltan = [t for t in OBLIGATORIAS_TEMPLATE if _es_vacio(leidos[t])]
-        if "RESERVA ($)" in faltan:
-            # Reported apart, by cell and all together: a lone space looks like an empty cell and vice versa.
-            faltan.remove("RESERVA ($)")
+        # A row with no amount moves no money: skipped and reported by cell, whatever else it lacks.
+        if _es_vacio(leidos["RESERVA ($)"]):
             reserva_vacia.append(
                 (f"{ws.title}!{get_column_letter(col['RESERVA ($)'])}{n}",
                  _como_esta_vacio(leidos["RESERVA ($)"]))
             )
-            fila_incompleta = True
-        else:
-            fila_incompleta = False
+            continue
+
+        if ws.row_dimensions[n].hidden:
+            ocultas.append(n)
+
+        # --- required cells (RESERVA ($) is present here) -------
+        faltan = [t for t in OBLIGATORIAS_TEMPLATE if _es_vacio(leidos[t])]
         if faltan:
             errores.append(f"{prefijo}fila {n}: falta {', '.join(faltan)}")
-            fila_incompleta = True
-        if fila_incompleta:
             continue
 
         fila_ok = True
@@ -484,9 +481,35 @@ def _leer_hoja(ws, etiqueta, fila_enc, columnas, canal, indice_grupo, grupos):
     }
 
 
+def _detalle_celdas(celdas, maximo=MAX_ERRORES_LISTADOS):
+    """[('Hoja!K12', 'vacía'), ...] -> 'Hoja!K12 (vacía), ...', first `maximo` plus a '...y N más' tail."""
+    texto = ", ".join(f"{celda} ({como})" for celda, como in celdas[:maximo])
+    if len(celdas) > maximo:
+        texto += f", ...y {len(celdas) - maximo} más"
+    return texto
+
+
+def _celdas_con_formula(ruta, celdas):
+    """The subset of `celdas` ('Hoja!K12') that hold a FORMULA in the file (read with data_only=True, one that was
+    never calculated looks blank)."""
+    wb = load_workbook(ruta, data_only=False)
+    try:
+        con_formula = set()
+        for referencia in celdas:
+            hoja, coordenada = referencia.rsplit("!", 1)
+            valor = wb[hoja][coordenada].value
+            if (isinstance(valor, str) and valor.startswith("=")) \
+                    or type(valor).__name__ in ("ArrayFormula", "DataTableFormula"):
+                con_formula.add(referencia)
+        return con_formula
+    finally:
+        wb.close()
+
+
 def leer_template(ruta, clave_esperada, grupos=None):
     """Read and validate ONE template (all its tabs); raises ValueError with every problem found, not just the first.
-    Returns {ruta, nombre, hoja, hojas, fila_encabezado, grupo, canal, fuente_canal, total, advertencias,
+    A row whose RESERVA ($) is blank is SKIPPED and reported as a warning (an uncalculated formula is an error instead).
+    Returns {ruta, nombre, hoja, hojas, fila_encabezado, grupo, canal, fuente_canal, total, sin_importe, advertencias,
     filas: [{'fila', 'hoja', 'valores': {Base column: value}}]}; 'hojas' is [{'hoja', 'etiqueta', 'filas', 'total'}]."""
     grupos = grupos if grupos is not None else GRUPOS
     ruta = os.path.abspath(ruta)
@@ -544,16 +567,17 @@ def leer_template(ruta, clave_esperada, grupos=None):
         filas = [f for h in leidas for f in h["filas"]]
 
         reserva_vacia = [c for h in leidas for c in h["reserva_vacia"]]
-        if reserva_vacia:
-            MAX_CELDAS = 30
-            detalle = ", ".join(f"{c} ({como})" for c, como in reserva_vacia[:MAX_CELDAS])
-            if len(reserva_vacia) > MAX_CELDAS:
-                detalle += f", ...y {len(reserva_vacia) - MAX_CELDAS} más"
+        # An uncalculated formula reads as blank: that is a file to fix, never a row "without amount".
+        con_formula = (
+            _celdas_con_formula(ruta, [celda for celda, _ in reserva_vacia]) if reserva_vacia else set()
+        )
+        if con_formula:
             errores.insert(0,
-                f"RESERVA ($) sin importe en {len(reserva_vacia)} celda(s): {detalle}. "
-                f"Escribe el importe (0 si de verdad es cero) o borra esa fila. Si la celda "
-                f"es una fórmula, abre el archivo en Excel y guárdalo para que se calcule."
+                f"RESERVA ($) trae una fórmula sin resultado guardado en {len(con_formula)} celda(s): "
+                f"{_detalle_celdas([(c, 'fórmula') for c, _ in reserva_vacia if c in con_formula])}. "
+                f"Abre el archivo en Excel y guárdalo para que se calcule."
             )
+        sin_importe = [(celda, como) for celda, como in reserva_vacia if celda not in con_formula]
         for h in leidas:
             if h["ocultas"]:
                 ocultas = h["ocultas"]
@@ -563,7 +587,7 @@ def leer_template(ruta, clave_esperada, grupos=None):
                     f"{'...' if len(ocultas) > MAX_ERRORES_LISTADOS else ''}. "
                     f"Muéstralas o elimínalas; no adivino cuáles querías pegar."
                 )
-        if not filas and not errores:
+        if not filas and not errores and not sin_importe:
             errores.append(
                 f"no trae filas de datos debajo de los encabezados "
                 f"(pestañas leídas: {[h['hoja'] for h in leidas]})"
@@ -597,8 +621,17 @@ def leer_template(ruta, clave_esperada, grupos=None):
                 f"{nombre}: {len(avisos_fecha)} fecha(s) de vigencia sin formato "
                 f"reconocido, p. ej. {avisos_fecha[0]}"
             )
+        if sin_importe:
+            advertencias.append(
+                f"{nombre}: {len(sin_importe)} fila(s) con RESERVA ($) sin importe NO se traspasaron "
+                f"({_detalle_celdas(sin_importe)}). Si esperabas un importe, escríbelo y vuelve a correr."
+            )
+        if not filas:
+            advertencias.append(
+                f"{nombre}: ningún renglón trae importe; de {canal} no se traspasó ni se reemplazó nada."
+            )
         for h in leidas:
-            if not h["filas"]:
+            if not h["filas"] and not h["reserva_vacia"]:
                 advertencias.append(
                     f"{nombre}: la pestaña '{h['hoja']}' no trae filas de datos."
                 )
@@ -617,6 +650,7 @@ def leer_template(ruta, clave_esperada, grupos=None):
             "canal":           canal,
             "fuente_canal":    fuente,
             "filas":           filas,
+            "sin_importe":     len(sin_importe),
             "total":           round(sum(f["valores"]["Importe"] for f in filas), 2),
             "advertencias":    advertencias,
         }
@@ -624,14 +658,8 @@ def leer_template(ruta, clave_esperada, grupos=None):
         wb.close()
 
 
-# --- Planning the paste (pure: reads, validates, writes nothing) ---
-def planificar_pegado(df_base, fila_encabezado, ultima_fila, rutas, clave_actual, grupos=None):
-    """Read every template, validate the lot and work out what the paste will do; writes nothing.
-    df_base, fila_encabezado and ultima_fila come from Consolidacion.leer_base(); clave_actual is the month being run.
-    Returns the plan dict used by aplicar_plan_a_df / aplicar_plan_a_libro / verificar_pegado / resumir_pegado."""
-    grupos = grupos if grupos is not None else GRUPOS
-
-    # --- the selection itself ------------------------------------------
+def _rutas_limpias(rutas):
+    """Absolute, de-quoted paths of a selection, blanks dropped; a repeated file or an empty selection is an error."""
     limpias, vistas = [], {}
     for ruta in rutas or []:
         if _es_vacio(ruta):
@@ -644,6 +672,32 @@ def planificar_pegado(df_base, fila_encabezado, ultima_fila, rutas, clave_actual
         limpias.append(absoluta)
     if not limpias:
         raise ValueError("No se eligió ningún template.")
+    return limpias
+
+
+def leer_layouts_control(rutas, clave_actual, grupos=None):
+    """READ-ONLY: validate and read the templates behind the 'Cifra Control' (nothing is written anywhere).
+    Returns one leer_template() dict per file; a ValueError carries EVERY file's problems together."""
+    grupos = grupos if grupos is not None else GRUPOS
+    archivos, problemas = [], []
+    for ruta in _rutas_limpias(rutas):
+        try:
+            archivos.append(leer_template(ruta, clave_actual, grupos))
+        except (ValueError, FileNotFoundError) as e:
+            problemas.append(str(e))
+    if problemas:
+        raise ValueError("\n\n".join(problemas))
+    return archivos
+
+
+# --- Planning the paste (pure: reads, validates, writes nothing) ---
+def planificar_pegado(df_base, fila_encabezado, ultima_fila, rutas, clave_actual, grupos=None):
+    """Read every template, validate the lot and work out what the paste will do; writes nothing.
+    df_base, fila_encabezado and ultima_fila come from Consolidacion.leer_base(); clave_actual is the month being run.
+    Returns the plan dict used by aplicar_plan_a_df / aplicar_plan_a_libro / verificar_pegado / resumir_pegado."""
+    grupos = grupos if grupos is not None else GRUPOS
+
+    limpias = _rutas_limpias(rutas)
 
     # --- 'Base' must be pasteable --------------------------------------
     if ultima_fila > fila_encabezado and ultima_fila not in set(df_base["_nfila"]):
@@ -676,9 +730,15 @@ def planificar_pegado(df_base, fila_encabezado, ultima_fila, rutas, clave_actual
             f"Hay más de un template del mismo canal ({detalle}). Pegarlos juntos "
             f"duplicaría el importe; elige uno por canal."
         )
+    if not any(a["filas"] for a in archivos):
+        avisos = "".join(f"\n  ⚠️ {av}" for a in archivos for av in a["advertencias"])
+        raise ValueError(
+            f"Ningún template trae renglones con importe en RESERVA ($): no hay nada que traspasar.{avisos}"
+        )
 
     archivos.sort(key=lambda a: a["grupo"])           # block order, deterministic
-    pegados = {a["grupo"] for a in archivos}
+    # A template with no amounts says nothing about its channel: it must not wipe what 'Base' already holds for it.
+    pegados = {a["grupo"] for a in archivos if a["filas"]}
 
     # --- rows of an OLDER paste: channel in 'Canal Venta', 'CT' still blank ---
     # Those rows are invisible to the (month, channel) lookup below, so a new paste would double the money: refuse instead.
@@ -985,10 +1045,11 @@ def resumir_pegado(plan, info=None):
         "archivos": [
             {"nombre": a["nombre"], "canal": a["canal"], "filas": len(a["filas"]),
              "total": a["total"], "fuente_canal": a["fuente_canal"],
-             "hojas": [dict(h) for h in a["hojas"]]}
+             "sin_importe": a["sin_importe"], "hojas": [dict(h) for h in a["hojas"]]}
             for a in plan["archivos"]
         ],
         "filas_pegadas":       len(plan["filas_nuevas"]),
+        "filas_sin_importe":   sum(a["sin_importe"] for a in plan["archivos"]),
         "total_pegado":        plan["total_nuevo"],
         "filas_reemplazadas":  len(plan["filas_a_reemplazar"]),
         "total_reemplazado":   plan["total_reemplazado"],

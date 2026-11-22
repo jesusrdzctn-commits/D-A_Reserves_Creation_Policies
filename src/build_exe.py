@@ -19,6 +19,7 @@ ARCHIVOS_REQUERIDOS = [
     "Create_Poliza_SAP.py",
     "Create_Poliza_Batch.py",
     "Upload_SAP.py",
+    "send_emails.py",
     "utils.py",
 ]
 

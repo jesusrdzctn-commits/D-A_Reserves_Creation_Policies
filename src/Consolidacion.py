@@ -4,6 +4,7 @@ Amounts in B and D are VALUES summed in pandas; everything else is a LIVE FORMUL
 Then hands the file to Comparativos.py for the PivotTables (needs Excel; optional, so a failure keeps the saved sheet).
 """
 
+import math
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ from difflib import SequenceMatcher
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -102,6 +104,13 @@ ANCHOS_COLUMNA = {
 # Add the variance / index formulas to the 'Grand Total' row too. The hand-made
 # sheet leaves G and H empty on that row; set to False to match it exactly.
 TOTAL_INCLUYE_VARIACION = True
+
+# --- 'Cifra Control' under the last block ---
+# Σ RESERVA ($) of the layouts ('Monto Layouts') vs Σ 'Grand Total' of the five blocks ('Monto RDA'); 'Var' lights up.
+TEXTO_SIN_DATO = "n/d"               # shown when the layouts could not be read: never a false green
+TOLERANCIA_CIFRA_CONTROL = 0.0       # |Var| <= this is green; 0 = the stakeholder's "the variation is zero"
+FILAS_ANTES_CIFRA_CONTROL = 2        # blank rows between the last 'Grand Total' and 'Cifra Control' (as in the template)
+VERDE_SEMAFORO, ROJO_SEMAFORO, AMBAR_SEMAFORO = "00B050", "C00000", "FFC000"
 
 # Also build the two PivotTable sheets once 'Variaciones' is saved (needs Excel + pywin32; False to skip).
 CONSTRUIR_COMPARATIVOS = True
@@ -495,7 +504,7 @@ def calcular_matrices(df, clave_anterior, clave_actual, grupos=None,
 
 # --- Writing the sheet ---
 def _escribir_bloque(ws, fila, matriz, clave_anterior, clave_actual, anio):
-    """Write one block starting at `fila`; returns the row where the NEXT block starts."""
+    """Write one block starting at `fila`; returns (row where the NEXT block starts, row of its 'Grand Total')."""
     f_banner   = fila
     f_titulo   = fila + 1
     f_encabeza = fila + 2
@@ -596,11 +605,114 @@ def _escribir_bloque(ws, fila, matriz, clave_anterior, clave_actual, anio):
             c = ws.cell(row=f_total, column=columna, value=0)
             c.font, c.number_format, c.border = _NEGRO_NEGRITA, CONTABLE_2, _BORDE_TOTAL
 
-    return f_total + 1 + FILAS_ENTRE_BLOQUES
+    return f_total + 1 + FILAS_ENTRE_BLOQUES, f_total
 
 
-def escribir_variaciones(wb, matrices, clave_anterior, clave_actual):
-    """Drop any existing 'Variaciones' sheet and rebuild it in its original tab position."""
+# --- Cifra Control ---
+def calcular_cifra_control(matrices, archivos, clave_actual, grupos=None, motivo=None):
+    """Σ RESERVA ($) of the layouts (rows of `clave_actual`) vs Σ 'Grand Total' of the blocks, in total and per channel.
+    `archivos` = leer_template() dicts, or None when they could not be read (`motivo` says why): 'layouts' is then None and
+    the sheet shows 'n/d', never a false green. 'var' = layouts - rda; 'cuadra' = |var| within TOLERANCIA_CIFRA_CONTROL."""
+    grupos = grupos if grupos is not None else GRUPOS
+    rda_por_bloque = [m["total_actual"] for m in matrices]
+    rda = round(sum(rda_por_bloque), 2)
+
+    if archivos is None:
+        return {"layouts": None, "rda": rda, "var": None, "cuadra": None, "por_canal": [],
+                "motivo": motivo or "No se eligieron templates."}
+
+    layouts_por_grupo = {}
+    for archivo in archivos:
+        suma = sum(f["valores"]["Importe"] for f in archivo["filas"] if f["valores"]["Mes"] == clave_actual)
+        layouts_por_grupo[archivo["grupo"]] = layouts_por_grupo.get(archivo["grupo"], 0.0) + suma
+
+    por_canal = []
+    for indice, rda_bloque in enumerate(rda_por_bloque):
+        layouts_bloque = layouts_por_grupo.get(indice)      # None = no template of this channel
+        por_canal.append({
+            "canal":    grupos[indice]["canal"],
+            "layouts":  None if layouts_bloque is None else round(layouts_bloque, 2),
+            "rda":      rda_bloque,
+            "var":      round((layouts_bloque or 0.0) - rda_bloque, 2),
+        })
+
+    layouts = round(sum(layouts_por_grupo.values()), 2)
+    var = round(layouts - rda, 2)
+    return {"layouts": layouts, "rda": rda, "var": var, "cuadra": abs(var) <= TOLERANCIA_CIFRA_CONTROL,
+            "por_canal": por_canal, "motivo": None}
+
+
+def _escribir_cifra_control(ws, fila, filas_total, control):
+    """Cifra Control from `fila`: Monto Layouts (a value), Monto RDA (Σ of the blocks' 'Grand Total' of the current
+    month, live), Var, and a traffic light on Var that stays live. Returns the cells used."""
+    f_layouts, f_rda, f_var = fila + 1, fila + 2, fila + 3
+    letra = get_column_letter(COL_MES_ACT)
+
+    ws.cell(row=fila, column=COL_CONCEPTO, value="Cifra Control").font = _NEGRO_NEGRITA
+    ws.cell(row=f_layouts, column=COL_CONCEPTO,
+            value=TEXTO_SIN_DATO if control["layouts"] is None else control["layouts"])
+    formula_rda = "=" + "+".join(f"{letra}{f}" for f in filas_total)
+    ws.cell(row=f_rda, column=COL_CONCEPTO, value=formula_rda)
+    formula_var = f'=IFERROR(ROUND(A{f_layouts}-A{f_rda},2),"{TEXTO_SIN_DATO}")'
+    ws.cell(row=f_var, column=COL_CONCEPTO, value=formula_var)
+
+    for f, formato, etiqueta in ((f_layouts, CONTABLE_2, "Monto Layouts"), (f_rda, CONTABLE_2, "Monto RDA"),
+                                 (f_var, "#,##0.00", "Var")):
+        celda = ws.cell(row=f, column=COL_CONCEPTO)
+        celda.font, celda.number_format, celda.alignment = _NEGRO_NORMAL, formato, Alignment(horizontal="right")
+        ws.cell(row=f, column=COL_MES_ANT, value=etiqueta).font = _NEGRO_NORMAL
+
+    ref, tol = f"$A${f_var}", repr(float(TOLERANCIA_CIFRA_CONTROL))
+    semaforo = (
+        (f"NOT(ISNUMBER({ref}))",                         AMBAR_SEMAFORO, "000000"),
+        (f"AND(ISNUMBER({ref}),ABS({ref})<={tol})",       VERDE_SEMAFORO, "FFFFFF"),
+        (f"AND(ISNUMBER({ref}),ABS({ref})>{tol})",        ROJO_SEMAFORO,  "FFFFFF"),
+    )
+    for condicion, fondo, texto in semaforo:
+        ws.conditional_formatting.add(
+            f"A{f_var}:B{f_var}",
+            FormulaRule(formula=[condicion], fill=_relleno(fondo),
+                        font=Font(bold=True, color=texto), stopIfTrue=True),
+        )
+
+    return {"titulo": f"A{fila}", "layouts": f"A{f_layouts}", "rda": f"A{f_rda}", "var": f"A{f_var}",
+            "formula_rda": formula_rda, "formula_var": formula_var}
+
+
+def verificar_cifra_control(ruta, control):
+    """Re-open the SAVED file and check the Cifra Control cells hold what was meant (RuntimeError otherwise)."""
+    celdas = control["celdas"]
+    wb = load_workbook(ruta, read_only=True, data_only=False)
+    try:
+        ws = wb[HOJA_VARIACIONES]
+        leido = {}
+        for clave in ("layouts", "rda", "var"):
+            fila = int(celdas[clave][1:])        # always column A
+            leido[clave] = next(ws.iter_rows(min_row=fila, max_row=fila, min_col=1, max_col=1,
+                                             values_only=True))[0]
+    finally:
+        wb.close()
+
+    esperado = TEXTO_SIN_DATO if control["layouts"] is None else control["layouts"]
+    if isinstance(esperado, str):
+        coincide = leido["layouts"] == esperado
+    else:
+        coincide = (isinstance(leido["layouts"], (int, float)) and not isinstance(leido["layouts"], bool)
+                    and math.isclose(leido["layouts"], esperado, rel_tol=1e-12, abs_tol=1e-9))
+    if not coincide:
+        raise RuntimeError(
+            f"Verificación fallida: Monto Layouts leído {leido['layouts']!r}, esperaba {esperado!r}.")
+    for clave in ("rda", "var"):
+        if leido[clave] != celdas[f"formula_{clave}"]:
+            raise RuntimeError(
+                f"Verificación fallida: la fórmula de {clave.upper()} quedó {leido[clave]!r}, "
+                f"esperaba {celdas[f'formula_{clave}']!r}."
+            )
+
+
+def escribir_variaciones(wb, matrices, clave_anterior, clave_actual, control=None):
+    """Drop any existing 'Variaciones' sheet and rebuild it in its original tab position. With `control` (see
+    calcular_cifra_control) the Cifra Control goes under the last block and its cells are stored in control['celdas']."""
     posicion = None
     if HOJA_VARIACIONES in wb.sheetnames:
         posicion = wb.sheetnames.index(HOJA_VARIACIONES)
@@ -610,8 +722,14 @@ def escribir_variaciones(wb, matrices, clave_anterior, clave_actual):
 
     anio = parse_clave_mes(clave_actual).year
     fila = FILA_INICIAL
+    filas_total = []
     for matriz in matrices:
-        fila = _escribir_bloque(ws, fila, matriz, clave_anterior, clave_actual, anio)
+        fila, f_total = _escribir_bloque(ws, fila, matriz, clave_anterior, clave_actual, anio)
+        filas_total.append(f_total)
+
+    if control is not None:
+        control["celdas"] = _escribir_cifra_control(
+            ws, filas_total[-1] + 1 + FILAS_ANTES_CIFRA_CONTROL, filas_total, control)
 
     for letra, ancho in ANCHOS_COLUMNA.items():
         ws.column_dimensions[letra].width = ancho
@@ -629,11 +747,14 @@ def construir_variaciones(
     con_comparativos=None,
     callback_status=None,
     templates=None,
+    layouts_control=None,
 ):
     """Build 'Variaciones', optionally pasting the 'RESERVAS MANUALES' `templates` into 'Base' first (None/empty = plain
     consolidation; if any template fails validation nothing is written). `mes`: None = current month, 'M07-26' re-runs a past one.
     Writes a COPY unless sobrescribir_original; `con_comparativos` None -> CONSTRUIR_COMPARATIVOS; `grupos` overrides GRUPOS (tests).
-    Returns a dict: ruta, mes_anterior, mes_actual, filas_base, bloques, totales... ('pegado': paste summary or None)."""
+    `layouts_control`: template paths read (read-only) ONLY for the 'Cifra Control' when `templates` is empty (already pasted).
+    Returns a dict: ruta, mes_anterior, mes_actual, filas_base, bloques, totales... ('pegado': paste summary or None,
+    'cifra_control': Σ layouts vs Σ RDA)."""
     def update_status(mensaje):
         if callback_status:
             callback_status(mensaje)
@@ -691,6 +812,23 @@ def construir_variaciones(
             f"catálogo y salen con su nombre original: {', '.join(no_mapeados)}"
         )
 
+    # --- Cifra Control: Σ RESERVA ($) of the layouts vs what the RDA gives ---
+    # With a paste the plan already read the templates; otherwise they are read here, read-only. An unreadable
+    # layout never aborts the consolidation: the control shows 'n/d' (amber) and says why.
+    archivos_control, motivo_control = None, None
+    if plan:
+        archivos_control = plan["archivos"]
+    elif layouts_control:
+        from Reservas_Manuales import leer_layouts_control
+
+        try:
+            archivos_control = leer_layouts_control(layouts_control, clave_actual, grupos)
+        except Exception as e:
+            # Deliberately broad: the control is secondary, so whatever goes wrong reading the layouts must not sink the consolidation.
+            motivo_control = f"No se pudieron leer los layouts: {e}"
+            update_status(f"⚠️ Cifra Control sin layouts. {motivo_control}")
+    control = calcular_cifra_control(matrices, archivos_control, clave_actual, grupos, motivo_control)
+
     # --- Where the result goes ----------------------------------------
     if sobrescribir_original:
         ruta_final = ruta_libro
@@ -714,10 +852,12 @@ def construir_variaciones(
                 info_escritura = aplicar_plan_a_libro(wb, plan)
 
             update_status(f"🎨 Escribiendo la pestaña '{HOJA_VARIACIONES}'...")
-            escribir_variaciones(wb, matrices, clave_anterior, clave_actual)
+            escribir_variaciones(wb, matrices, clave_anterior, clave_actual, control)
             wb.save(ruta_final)
         finally:
             wb.close()
+
+        verificar_cifra_control(ruta_final, control)
 
         if plan:
             # Re-open what is ON DISK and compare it cell by cell: a paste that looked fine in memory must not reach the stakeholder.
@@ -751,6 +891,16 @@ def construir_variaciones(
             comparativos_error = str(e)
             update_status(f"⚠️ No pude crear las tablas dinámicas: {e}")
 
+    if control["cuadra"] is False:
+        update_status(
+            f"🔴 Cifra Control NO cuadra: layouts {control['layouts']:,.2f} vs RDA {control['rda']:,.2f} "
+            f"(Var {control['var']:,.2f})"
+        )
+    elif control["cuadra"] is None:
+        update_status(f"🟡 Cifra Control sin dato: {control['motivo']}")
+    else:
+        update_status("🟢 Cifra Control cuadra (Var = 0)")
+
     update_status("✅ Consolidación completada")
 
     return {
@@ -773,6 +923,8 @@ def construir_variaciones(
         "canales_sin_bloque":   canales_sin_bloque,
         # Summary of the template paste (None when no templates were chosen).
         "pegado":               pegado,
+        # Σ layouts vs Σ RDA: layouts/rda/var/cuadra (True/False, None = no data)/por_canal/motivo/celdas.
+        "cifra_control":        control,
     }
 
 

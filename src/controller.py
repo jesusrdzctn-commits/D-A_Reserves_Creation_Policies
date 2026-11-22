@@ -7,13 +7,22 @@ hands the batch file it produced to step 4 through the GUI.
 
 import os
 from datetime import datetime
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 from Comparativos import HOJA_COMPARATIVO_AGRUPADOR, HOJA_COMPARATIVO_BU
 from Consolidacion import GRUPOS, HOJA_VARIACIONES, construir_variaciones, resolver_grupo
 from Create_Poliza_Batch import fecha_contable, generar_poliza_batch
 from Create_Poliza_SAP import NOMBRES_HOJAS_LAYOUT, generar_poliza_sap
 from Reservas_Manuales import previsualizar_pegado, traspasar_templates
+from send_emails import (
+    MODO_BORRADOR,
+    MODO_ENVIAR,
+    cargar_destinatarios,
+    enviar_correos,
+    guardar_destinatarios,
+    previsualizar_correos,
+    ruta_destinatarios,
+)
 from Upload_SAP import SOCIEDAD, TIPO_DOC, TRANSACCION, preparar_subida_sap
 from utils import claves_mes_actual_y_anterior, etiqueta_mes_es
 
@@ -30,6 +39,10 @@ class ReservasController:
         self.gui.on_consolidar = self.execute_consolidacion
         self.gui.on_poliza     = self.execute_poliza_sap
         self.gui.on_subir      = self.execute_subida_sap
+        self.gui.on_enviar_correos = self.execute_enviar_correos
+        self.gui.on_destinatarios  = self.execute_destinatarios
+        # The last 'Variaciones' file built in THIS session (never restored from disk) and whether its e-mails went out.
+        self._ultima_variaciones = None
         # The step 1 checklist lights a channel from the template FILE NAME (alphabetical order).
         self.gui.configurar_canales(sorted(g["canal"] for g in GRUPOS), self._canal_por_nombre)
 
@@ -192,6 +205,14 @@ class ReservasController:
         mes        = self.gui.get_mes()
         anterior, actual = claves_mes_actual_y_anterior(mes)
 
+        # The layouts of card 1 feed the 'Cifra Control' only (read-only here; the paste itself is step 1).
+        layouts = self.gui.get_templates()
+        if layouts:
+            linea_control = f"  🚦 Cifra Control: Σ RESERVA ($) de {len(layouts)} layout(s) vs Σ Grand Total\n"
+        else:
+            linea_control = ("  🚦 Cifra Control: sin layouts en la tarjeta 1 saldrá 'n/d'\n"
+                             "               (agrégalos allá si quieres el semáforo)\n")
+
         confirm = messagebox.askyesno(
             "Confirmar consolidación",
             f"¿Generar la pestaña '{HOJA_VARIACIONES}'?\n\n"
@@ -200,7 +221,8 @@ class ReservasController:
             f"               ({etiqueta_mes_es(anterior)} vs {etiqueta_mes_es(actual)})\n"
             f"  📊 Además  : '{HOJA_COMPARATIVO_BU}' y\n"
             f"               '{HOJA_COMPARATIVO_AGRUPADOR}'\n"
-            f"               (tablas dinámicas: año pasado arriba, año actual abajo)\n\n"
+            f"               (tablas dinámicas: año pasado arriba, año actual abajo)\n"
+            f"{linea_control}\n"
             f"Se trabajará sobre una COPIA en la subcarpeta 'Output',\n"
             f"así que el archivo original no se toca."
         )
@@ -212,13 +234,18 @@ class ReservasController:
             self.gui.marcar_paso("consolidacion", "en_curso")
             ok, payload = self._ejecutar(lambda: construir_variaciones(
                 ruta_libro, mes=mes, callback_status=self.gui.set_status,
+                layouts_control=layouts or None,
             ))
             if ok:
                 self.gui.marcar_paso("consolidacion", "listo")
+                self._ultima_variaciones = {
+                    "ruta": payload["ruta"], "cifra": payload.get("cifra_control"), "enviado": False,
+                }
                 self.gui.set_status("✅ ¡Consolidación completada!")
                 messagebox.showinfo(
                     "Consolidación completada",
-                    self._texto_variaciones(payload),
+                    self._texto_variaciones(payload)
+                    + "\n\n✉️ Cuando la revises, 'Enviar variaciones por correo' las manda a cada stakeholder.",
                 )
             else:
                 self.gui.marcar_paso("consolidacion", "error")
@@ -226,6 +253,137 @@ class ReservasController:
                 messagebox.showerror("Error en la consolidación", payload)
         finally:
             self._finalizar()
+
+    # --- PROCESO 2 (cont.) — correos de variaciones ---
+    def execute_destinatarios(self):
+        """Recipients window: the addresses are saved per user, outside the project (see send_emails.ruta_destinatarios)."""
+        try:
+            actuales = cargar_destinatarios()
+        except ValueError as e:
+            messagebox.showwarning(
+                "Destinatarios guardados dañados",
+                f"{e}\n\nPuedes capturarlos de nuevo: al guardar se reemplaza ese archivo.",
+            )
+            actuales = {}
+
+        guardados = self.gui.editar_destinatarios(
+            [(g["canal"], g["titulo"]) for g in GRUPOS], actuales, guardar_destinatarios,
+            ubicacion=ruta_destinatarios(),
+        )
+        if guardados is not None:
+            con_correo = sum(1 for v in guardados.values() if v["para"])
+            self.gui.set_status(f"✅ Destinatarios guardados ({con_correo} de {len(GRUPOS)} canales con correo)")
+
+    @staticmethod
+    def _texto_confirmacion_correos(ruta, bloques, correos, omitidos, cifra):
+        """Confirmation box of the e-mails: who gets what, who is skipped, and whether the control figure matches."""
+        bloque = next(iter(bloques.values()))
+        lineas = "\n".join(
+            f"     • {c['titulo']:<16} → {'; '.join(c['para'])}" + (f"  (+{len(c['cc'])} CC)" if c["cc"] else "")
+            for c in correos
+        )
+        texto = (
+            f"¿Mandar las variaciones a los stakeholders?\n\n"
+            f"  📄 Archivo : {os.path.basename(ruta)}\n"
+            f"  📅 Compara : {bloque['mes_anterior']} vs {bloque['mes_actual']}\n"
+            f"  ✉️ Correos ({len(correos)}):\n{lineas}\n"
+        )
+        if omitidos:
+            texto += "\n  ⚠️ Sin correo: " + "; ".join(f"{c} ({m})" for c, m in omitidos) + "\n"
+        if cifra and cifra.get("cuadra") is False:
+            texto += (f"\n  🔴 La Cifra Control NO cuadra (Var {cifra['var']:,.2f}): "
+                      f"revisa antes de mandar números a los canales.\n")
+        elif cifra and cifra.get("cuadra") is None:
+            texto += "\n  🟡 La Cifra Control quedó sin dato (n/d).\n"
+        return texto + (
+            "\n  Sí = ENVIAR ahora\n"
+            "  No = guardar como BORRADORES en Outlook, para revisarlos y mandarlos tú\n"
+            "  Cancelar = no hacer nada"
+        )
+
+    def execute_enviar_correos(self):
+        ultima = self._ultima_variaciones
+        if ultima and os.path.exists(ultima["ruta"]):
+            ruta, cifra = ultima["ruta"], ultima["cifra"]
+        else:
+            ultima, cifra = None, None
+            ruta = filedialog.askopenfilename(
+                title="Archivo con la pestaña 'Variaciones'",
+                filetypes=[("Libros de Excel", "*.xlsx *.xlsm"), ("Todos los archivos", "*.*")],
+            )
+            if not ruta:
+                return
+
+        try:
+            destinatarios = cargar_destinatarios()
+        except ValueError as e:
+            messagebox.showerror("Destinatarios", str(e))
+            return
+
+        ok, previa = self._ejecutar(lambda: previsualizar_correos(ruta, destinatarios))
+        if not ok:
+            messagebox.showerror("No se pueden preparar los correos", previa)
+            return
+        bloques, correos, omitidos = previa
+        if not correos:
+            detalle = "\n".join(f"  • {c}: {m}" for c, m in omitidos)
+            messagebox.showwarning(
+                "Sin destinatarios",
+                f"No hay ningún correo que mandar:\n{detalle}\n\nCaptura los correos con '👥 Destinatarios'.",
+            )
+            return
+
+        decision = messagebox.askyesnocancel(
+            "Enviar variaciones",
+            self._texto_confirmacion_correos(ruta, bloques, correos, omitidos, cifra),
+        )
+        if decision is None:
+            return
+        modo = MODO_ENVIAR if decision else MODO_BORRADOR
+
+        # A second click on 'Sí' would e-mail every stakeholder twice.
+        if modo == MODO_ENVIAR and ultima and ultima["enviado"]:
+            if not messagebox.askyesno(
+                "Ya se enviaron",
+                "Los correos de este archivo ya se enviaron en esta sesión.\n\n¿Enviarlos OTRA VEZ?",
+                default="no",
+            ):
+                return
+
+        self.gui.disable_buttons()
+        try:
+            ok, payload = self._ejecutar(lambda: enviar_correos(
+                ruta, destinatarios, modo=modo, callback_status=self.gui.set_status,
+            ))
+            if not ok:
+                self.gui.set_status("❌ No se enviaron los correos")
+                messagebox.showerror("Error con los correos", payload)
+                return
+
+            if modo == MODO_ENVIAR and ultima and any(r["estado"] == "enviado" for r in payload["resultados"]):
+                ultima["enviado"] = True
+            con_error = [r for r in payload["resultados"] if r["estado"] == "error"]
+            self.gui.set_status(
+                "✅ Correos completados" if not con_error else "⚠️ Correos completados con errores"
+            )
+            mostrar = messagebox.showwarning if con_error else messagebox.showinfo
+            mostrar("Correos", self._texto_correos(payload))
+        finally:
+            self._finalizar()
+
+    @staticmethod
+    def _texto_correos(resumen):
+        """Result popup of the e-mails: one line per channel, errors spelled out."""
+        iconos = {"enviado": "✅ enviado", "borrador": "📝 borrador", "error": "❌ error"}
+        texto = ("Correos ENVIADOS:" if resumen["modo"] == MODO_ENVIAR
+                 else "Borradores guardados en Outlook (revísalos y envíalos tú):") + "\n"
+        texto += "\n".join(
+            f"  • {r['titulo']:<16} {iconos[r['estado']]}" + (f": {r['detalle']}" if r["estado"] == "error" else "")
+            for r in resumen["resultados"]
+        )
+        if resumen["omitidos"]:
+            texto += "\n\n⚠️ Sin correo: " + "; ".join(f"{c} ({m})" for c, m in resumen["omitidos"])
+        return texto
 
     # --- PROCESO 2 — sección 'PÓLIZA SAP' ---
     @staticmethod
@@ -379,6 +537,7 @@ class ReservasController:
             f"  • Σ {resumen['mes_actual']}        : {resumen['total_actual']:,.2f}"
         )
 
+        texto += ReservasController._texto_cifra_control(resumen.get("cifra_control"))
         texto += ReservasController._texto_pegado(resumen.get("pegado"))
         texto += ReservasController._texto_comparativos(resumen)
 
@@ -474,6 +633,27 @@ class ReservasController:
         return texto
 
     @staticmethod
+    def _texto_cifra_control(control):
+        """'Cifra Control' part of the popup: 🟢 cuadra, 🔴 per-channel detail, 🟡 no layouts (n/d)."""
+        if not control:
+            return ""
+        if control["cuadra"] is None:
+            return f"\n\n🟡 Cifra Control: n/d — {control['motivo']}"
+
+        texto = (
+            f"\n\n{'🟢' if control['cuadra'] else '🔴'} Cifra Control:\n"
+            f"  • Monto Layouts : {control['layouts']:,.2f}\n"
+            f"  • Monto RDA     : {control['rda']:,.2f}\n"
+            f"  • Var           : {control['var']:,.2f}"
+        )
+        if not control["cuadra"]:
+            for canal in control["por_canal"]:
+                if canal["var"]:
+                    layouts = "sin layout" if canal["layouts"] is None else f"{canal['layouts']:,.2f}"
+                    texto += f"\n     ⚠️ {canal['canal']}: {layouts} vs RDA {canal['rda']:,.2f} (Var {canal['var']:,.2f})"
+        return texto
+
+    @staticmethod
     def _texto_comparativos(resumen):
         """PivotTable half of the 'Variaciones' popup: built, skipped on purpose, or failed.
         A failure is not an error dialog (the sheet is already saved) but must not be silent either."""
@@ -511,6 +691,12 @@ class ReservasController:
             f"{comparativos['anio_actual']} abajo):\n"
             + "\n".join(lineas)
         )
+
+        for resumen_analisis in comparativos.get("analisis") or []:
+            texto += (
+                f"\n     ➕ '{resumen_analisis['hoja']}': filas %, B/W, % VS YAGO e INDEX de "
+                f"{resumen_analisis['agrupadores']} agrupador(es) (agrupadas) y colores por Q"
+            )
 
         for aviso in comparativos.get("advertencias") or []:
             texto += f"\n     ⚠️ {aviso}"

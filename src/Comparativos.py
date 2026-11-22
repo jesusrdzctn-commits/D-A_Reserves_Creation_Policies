@@ -4,13 +4,18 @@ Uses win32com because openpyxl cannot CREATE a pivot cache; it runs LAST and OPT
 (never the other way round: an openpyxl round-trip loses a fresh pivot cache). No Excel/pywin32 -> reported as skipped.
 """
 
+import math
 import os
 from datetime import datetime
+
+from openpyxl.utils import get_column_letter
 
 from utils import (
     abrir_excel,
     carpeta_output_desde_input,
     cerrar_excel,
+    clave_mes,
+    error_de_excel,
     hoja_por_nombre,
     norm_texto,
     parse_clave_mes,
@@ -69,6 +74,17 @@ NOMBRE_CAMPO_VALOR = "Suma de Importe"
 TITULO_TABLA = "Creaciones {anio}"
 
 
+# Sheets that get the analysis rows under their pivots and the quarter colours (the BU sheet stays as it was).
+HOJAS_CON_ANALISIS = {HOJA_COMPARATIVO_AGRUPADOR}
+
+# Per agrupador, under the current-year pivot (same layout as the stakeholder's template): label row, these 4 rows
+# (grouped in Excel), one blank row. FILAS_ANTES_ANALISIS blank rows separate the pivot's Grand Total from the first label.
+ETIQUETAS_ANALISIS   = ("%", "B/W", "% VS YAGO", "INDEX")
+FILAS_ANTES_ANALISIS = 1
+FILAS_POR_BLOQUE     = 1 + len(ETIQUETAS_ANALISIS) + 1
+TEXTO_SIN_ETIQUETA   = "(en blanco)"
+TOLERANCIA_ANALISIS  = 1e-6    # relative; amounts also get an absolute 0.01 (cents)
+
 # --- Styles — same palette as the 'Variaciones' sheet ---
 GRIS_CREACIONES = "BFBFBF"   # banner above each pivot
 AZUL_TITULO     = "DCE6F2"   # sheet heading
@@ -77,6 +93,11 @@ FUENTE = "Calibri"
 TAM    = 10
 
 CONTABLE_2 = '_-* #,##0.00_-;\\-* #,##0.00_-;_-* "-"??_-;_-@_-'
+PORCENTAJE = "0.0%"
+CONTABLE_1 = '_-* #,##0.0_-;\\-* #,##0.0_-;_-* "-"??_-;_-@_-'
+
+# One soft colour per calendar quarter (Q1..Q4) for the month columns of the two pivots.
+COLORES_Q = {1: "DDEBF7", 2: "E2EFDA", 3: "FFF2CC", 4: "FCE4D6"}
 
 # Built-in PivotTable style (None = Excel's default); an unknown name is ignored: cosmetics must never kill a run.
 ESTILO_TABLA = "PivotStyleMedium9"
@@ -295,12 +316,257 @@ def _preparar_hoja(wb, nombre):
     return ws
 
 
+# --- Analysis rows and quarter colours (pure planning first, COM writing after) ---
+def _clave_o_none(valor):
+    """Month key of a pivot header cell, or None when it is not one ('Grand Total', 'Mes', ...)."""
+    if not isinstance(valor, str):
+        return None
+    try:
+        return clave_mes(parse_clave_mes(valor))
+    except ValueError:
+        return None
+
+
+def _numero(valor, donde):
+    """Pivot data cell -> float (empty = 0). Anything else (text, error) is refused: it would poison every formula."""
+    if valor is None:
+        return 0.0
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        raise ValueError(f"Valor no numérico en {donde}: {valor!r}.")
+    return float(valor)
+
+
+def leer_geometria(valores, fila0, col0):
+    """Parse the values of a pivot's TableRange2 (top-left at fila0/col0) WITHOUT trusting any localised text:
+    the month header row is the first one holding month keys, the last row is the Grand Total row (ColumnGrand), the last
+    column the Grand Total column. Returns rows/columns by label and the numbers, for formulas and for the check."""
+    if len(valores) < 3 or min(len(f) for f in valores) < 3:
+        raise ValueError("La tabla dinámica es demasiado pequeña para analizarla.")
+
+    cabecera, meses = None, {}
+    for i, fila in enumerate(valores[:-1]):
+        meses = {}
+        for j in range(1, len(fila) - 1):
+            clave = _clave_o_none(fila[j])
+            if clave is not None:
+                meses[clave] = col0 + j
+        if meses:
+            cabecera = i
+            break
+    if cabecera is None or cabecera + 2 > len(valores) - 1:
+        raise ValueError("No encontré la fila de meses de la tabla dinámica.")
+
+    filas, orden, datos, crudas = {}, [], {}, {}
+    for i in range(cabecera + 1, len(valores) - 1):
+        crudo = valores[i][0]
+        vacia = crudo is None or (isinstance(crudo, str) and crudo.strip() == "")
+        etiqueta = TEXTO_SIN_ETIQUETA if vacia else str(crudo)
+        if etiqueta in filas:
+            raise ValueError(f"La etiqueta '{etiqueta}' se repite en la tabla dinámica.")
+        filas[etiqueta] = fila0 + i
+        crudas[etiqueta] = None if vacia else crudo      # None = the label cell is empty: written as text, not linked
+        orden.append(etiqueta)
+        for clave, col in meses.items():
+            datos[(etiqueta, clave)] = _numero(valores[i][col - col0], f"{etiqueta} / {clave}")
+
+    gt = {clave: _numero(valores[-1][col - col0], f"Grand Total / {clave}") for clave, col in meses.items()}
+    return {
+        "col0": col0, "fila_cabecera": fila0 + cabecera, "fila_gt": fila0 + len(valores) - 1,
+        "meses": meses, "filas": filas, "orden": orden, "crudas": crudas, "valores": datos, "gt": gt,
+    }
+
+
+def _clave_anio_anterior(clave):
+    """'M10-26' -> 'M10-25'."""
+    fecha = parse_clave_mes(clave)
+    return clave_mes(fecha.replace(year=fecha.year - 1))
+
+
+def planear_analisis(prev, cur, fila_inicio):
+    """Rows of the analysis under the current-year pivot, one block per agrupador (the current year's first, then the ones
+    only last year had, so the B/W of every month adds up to the pivots' difference). Cells point at the pivot cells of
+    the SAME agrupador and the SAME month (matched by label and key, never by position); a missing counterpart is 0.
+    Returns {'filas': [spec], 'grupos': [(first, last)], 'fila_fin', 'columnas'}; a spec is one row of cells with
+    its formulas AND the value they must give (computed here from the pivot numbers, to check Excel's answer)."""
+    meses = sorted(cur["meses"].items(), key=lambda par: par[1])
+    orden = list(cur["orden"]) + [e for e in prev["orden"] if e not in cur["filas"]]
+    col_etiqueta = get_column_letter(cur["col0"])
+
+    filas, grupos = [], []
+    fila = fila_inicio
+    for etiqueta in orden:
+        en_cur, en_prev = etiqueta in cur["filas"], etiqueta in prev["filas"]
+        fuente = cur if en_cur else prev
+        if fuente["crudas"][etiqueta] is None:
+            filas.append({"fila": fila, "col": cur["col0"], "tipo": "texto", "formulas": [etiqueta],
+                          "esperado": [etiqueta], "formato": None, "negrita": False, "rol": "etiqueta"})
+        else:
+            filas.append({"fila": fila, "col": cur["col0"], "tipo": "formula",
+                          "formulas": [f"={col_etiqueta}{fuente['filas'][etiqueta]}"],
+                          "esperado": [fuente["crudas"][etiqueta]], "formato": None, "negrita": False,
+                          "rol": "etiqueta"})
+
+        f_pct, f_bw, f_vs, f_idx = fila + 1, fila + 2, fila + 3, fila + 4
+        pct, bw, vs, idx = ([], [], [], [])
+        esp_pct, esp_bw, esp_vs, esp_idx = ([], [], [], [])
+        for clave, col in meses:
+            c = get_column_letter(col)
+            clave_prev = _clave_anio_anterior(clave)
+            ref_cur = f"{c}{cur['filas'][etiqueta]}" if en_cur else "0"
+            ref_prev = (f"{get_column_letter(prev['meses'][clave_prev])}{prev['filas'][etiqueta]}"
+                        if en_prev and clave_prev in prev["meses"] else "0")
+            ref_gt = f"{c}{cur['fila_gt']}"
+            # Same arithmetic as the stakeholder's template: B/W = last year - this year.
+            pct.append(f"=IFERROR({ref_cur}/{ref_gt},0)")
+            bw.append(f"={ref_prev}-{ref_cur}")
+            vs.append(f"=IFERROR(-{c}{f_bw}/{ref_prev},0)")
+            idx.append(f"=IFERROR(((-{c}{f_bw}/{ref_prev}*100)+100),0)")
+
+            v_cur = cur["valores"].get((etiqueta, clave), 0.0) if en_cur else 0.0
+            v_prev = prev["valores"].get((etiqueta, clave_prev), 0.0) if en_prev else 0.0
+            gt = cur["gt"].get(clave, 0.0)
+            diferencia = v_prev - v_cur
+            esp_pct.append(v_cur / gt if gt else 0.0)
+            esp_bw.append(diferencia)
+            esp_vs.append(-diferencia / v_prev if v_prev else 0.0)
+            esp_idx.append((-diferencia / v_prev * 100) + 100 if v_prev else 0.0)
+
+        col1 = cur["col0"] + 1
+        for f, rol, etiq, formulas, esperado, formato in (
+            (f_pct, "pct", ETIQUETAS_ANALISIS[0], pct, esp_pct, PORCENTAJE),
+            (f_bw,  "bw",  ETIQUETAS_ANALISIS[1], bw,  esp_bw,  CONTABLE_2),
+            (f_vs,  "vs",  ETIQUETAS_ANALISIS[2], vs,  esp_vs,  PORCENTAJE),
+            (f_idx, "idx", ETIQUETAS_ANALISIS[3], idx, esp_idx, CONTABLE_1),
+        ):
+            filas.append({"fila": f, "col": cur["col0"], "tipo": "texto", "formulas": [etiq],
+                          "esperado": [etiq], "formato": None, "negrita": True, "rol": "rotulo"})
+            filas.append({"fila": f, "col": col1, "tipo": "formula", "formulas": formulas,
+                          "esperado": esperado, "formato": formato, "negrita": False, "rol": rol})
+        grupos.append((f_pct, f_idx))
+        fila += FILAS_POR_BLOQUE
+
+    return {"filas": filas, "grupos": grupos, "fila_fin": fila - 2, "fila_inicio": fila_inicio,
+            "columnas": [col for _, col in meses], "meses": [clave for clave, _ in meses],
+            "agrupadores": len(orden)}
+
+
+def revisar_cuadre(plan, prev, cur):
+    """Σ B/W of every month must equal last year's Grand Total minus this year's: the check that no agrupador was
+    dropped or counted twice. Returns a list of problems (empty = fine)."""
+    problemas = []
+    for posicion, clave in enumerate(plan["meses"]):
+        suma = 0.0
+        for spec in plan["filas"]:
+            if spec["rol"] == "bw":
+                suma += spec["esperado"][posicion]
+        esperado = prev["gt"].get(_clave_anio_anterior(clave), 0.0) - cur["gt"].get(clave, 0.0)
+        if not math.isclose(suma, esperado, rel_tol=TOLERANCIA_ANALISIS, abs_tol=0.01):
+            problemas.append(f"{clave}: Σ B/W {suma:,.2f} ≠ Grand Total año anterior − actual {esperado:,.2f}")
+    return problemas
+
+
+def _es_numero(valor):
+    return isinstance(valor, (int, float)) and not isinstance(valor, bool)
+
+
+def revisar_hoja(plan, leido, fila0, col0):
+    """Compare what Excel calculated (`leido`: rows from fila0, col0) with what each cell must give. Returns the problems."""
+    problemas = []
+    for spec in plan["filas"]:
+        fila_rel = spec["fila"] - fila0
+        for desplazamiento, esperado in enumerate(spec["esperado"]):
+            col = spec["col"] + desplazamiento
+            valor = leido[fila_rel][col - col0]
+            celda = f"{get_column_letter(col)}{spec['fila']}"
+            error = error_de_excel(valor)
+            if error:
+                problemas.append(f"{celda}: Excel devolvió {error}")
+            elif _es_numero(esperado):
+                if not _es_numero(valor) or not math.isclose(valor, esperado, rel_tol=TOLERANCIA_ANALISIS, abs_tol=1e-6):
+                    problemas.append(f"{celda}: vale {valor!r}, debía valer {esperado!r}")
+            elif valor != esperado:
+                problemas.append(f"{celda}: dice {valor!r}, debía decir {esperado!r}")
+    return problemas
+
+
+def planear_colores_q(geom):
+    """[(row1, col1, row2, col2, 'RRGGBB')]: each month column from its header cell to its Grand Total cell gets its
+    calendar quarter's colour; neighbouring columns of one quarter merge into a single range."""
+    rangos = []
+    for clave, col in sorted(geom["meses"].items(), key=lambda par: par[1]):
+        color = COLORES_Q[(parse_clave_mes(clave).month - 1) // 3 + 1]
+        if rangos and rangos[-1][4] == color and rangos[-1][3] == col - 1:
+            rangos[-1] = (*rangos[-1][:3], col, color)
+        else:
+            rangos.append((geom["fila_cabecera"], col, geom["fila_gt"], col, color))
+    return rangos
+
+
+def _pintar_trimestres(ws, geom):
+    """Colour the month columns of one pivot by quarter."""
+    for fila1, col1, fila2, col2, color in planear_colores_q(geom):
+        ws.Range(ws.Cells(fila1, col1), ws.Cells(fila2, col2)).Interior.Color = _color_excel(color)
+
+
+def _escribir_analisis(ws, plan):
+    """Write the planned rows (one COM call per row of cells), group each block's four rows and leave the font uniform."""
+    ultima_col = max(plan["columnas"])
+    area = ws.Range(ws.Cells(plan["fila_inicio"], 1), ws.Cells(plan["fila_fin"], ultima_col))
+    area.Font.Name = FUENTE
+    area.Font.Size = TAM
+
+    for spec in plan["filas"]:
+        n = len(spec["formulas"])
+        rango = ws.Range(ws.Cells(spec["fila"], spec["col"]), ws.Cells(spec["fila"], spec["col"] + n - 1))
+        # .Formula is always en-US, whatever the Excel language.
+        contenido = spec["formulas"][0] if n == 1 else (tuple(spec["formulas"]),)
+        if spec["tipo"] == "formula":
+            rango.Formula = contenido
+        else:
+            rango.Value = contenido
+        if spec["formato"]:
+            rango.NumberFormat = spec["formato"]
+        if spec["negrita"]:
+            rango.Font.Bold = True
+
+    for primera, ultima in plan["grupos"]:
+        ws.Range(ws.Cells(primera, 1), ws.Cells(ultima, 1)).EntireRow.Group()
+
+
+def _agregar_analisis(ws, prev, cur, nombre_hoja):
+    """Plan, write and VERIFY the analysis rows under the current-year pivot; raises RuntimeError if Excel's results
+    differ from the pivots' numbers. Returns the summary dict."""
+    fila_inicio = cur["fila_gt"] + 1 + FILAS_ANTES_ANALISIS
+    plan = planear_analisis(prev, cur, fila_inicio)
+
+    problemas = revisar_cuadre(plan, prev, cur)
+    if problemas:
+        raise RuntimeError(f"'{nombre_hoja}': el análisis no cuadra con las tablas dinámicas. " + "; ".join(problemas[:5]))
+
+    _escribir_analisis(ws, plan)
+    ws.Calculate()
+
+    ultima_col = max(plan["columnas"])
+    leido = _bloque(ws, fila_inicio, 1, plan["fila_fin"], ultima_col)
+    problemas = revisar_hoja(plan, leido, fila_inicio, 1)
+    if problemas:
+        raise RuntimeError(
+            f"'{nombre_hoja}': verificación de las filas de análisis fallida ({len(problemas)}): "
+            + "; ".join(problemas[:5])
+        )
+    return {"hoja": nombre_hoja, "agrupadores": plan["agrupadores"], "meses": plan["meses"],
+            "fila_inicio": fila_inicio, "fila_fin": plan["fila_fin"]}
+
+
 def _construir_hoja(wb, cache, nombre_hoja, encabezado_hoja, campo_fila,
                     prefijo_tabla, anios, meses_por_anio, ocupados, update_status):
-    """Build one comparison sheet: heading, then one banner + one pivot per year. Returns (ws, [info de cada tabla], [advertencias])."""
+    """Build one comparison sheet: heading, then one banner + one pivot per year. Sheets in HOJAS_CON_ANALISIS also get
+    quarter colours and, under the last pivot, the analysis rows. Returns (ws, [info de cada tabla], [advertencias], analisis | None)."""
     ws = _preparar_hoja(wb, nombre_hoja)
     _banner(ws, FILA_ENCABEZADO_HOJA, encabezado_hoja, AZUL_TITULO, tam=TAM + 1)
 
+    con_analisis = nombre_hoja in HOJAS_CON_ANALISIS
+    geometrias = {}
     tablas, advertencias = [], []
     fila = FILA_PRIMERA_TABLA
 
@@ -339,6 +605,16 @@ def _construir_hoja(wb, cache, nombre_hoja, encabezado_hoja, campo_fila,
         except Exception:
             total = None
 
+        if con_analisis:
+            ultima_col = rango.Column + rango.Columns.Count - 1
+            geometrias[anio] = leer_geometria(_bloque(ws, rango.Row, rango.Column, fila_fin, ultima_col),
+                                              rango.Row, rango.Column)
+            try:
+                _pintar_trimestres(ws, geometrias[anio])
+            except Exception as e:
+                # Cosmetic only: a colour that will not paint must not discard the pivots.
+                advertencias.append(f"{nombre_hoja}: no pude pintar los trimestres de {anio}: {e}")
+
         tablas.append({
             "hoja":   nombre_hoja,
             "tabla":  nombre_tabla,
@@ -350,6 +626,18 @@ def _construir_hoja(wb, cache, nombre_hoja, encabezado_hoja, campo_fila,
 
         fila = fila_fin + FILAS_ENTRE_TABLAS + 2   # +1 blank, +1 for the next banner
 
+    analisis = None
+    if con_analisis:
+        previa, actual = geometrias.get(anios[0]), geometrias.get(anios[-1])
+        if previa and actual:
+            update_status(f"   • {nombre_hoja}: filas de análisis (%, B/W, % VS YAGO, INDEX)")
+            analisis = _agregar_analisis(ws, previa, actual, nombre_hoja)
+        else:
+            advertencias.append(
+                f"{nombre_hoja}: falta la tabla de {anios[0]} o la de {anios[-1]}; "
+                f"no se agregaron las filas de análisis."
+            )
+
     # Widths last, once everything is on the sheet.
     try:
         ws.UsedRange.Columns.AutoFit()
@@ -358,7 +646,7 @@ def _construir_hoja(wb, cache, nombre_hoja, encabezado_hoja, campo_fila,
         pass
 
     ws.Cells(1, 1).Select()   # leave the sheet scrolled to the top
-    return ws, tablas, advertencias
+    return ws, tablas, advertencias, analisis
 
 
 # --- Main entry point ---
@@ -372,7 +660,8 @@ def construir_comparativos(
     """Build the 'Comparativo BU Mes' and 'Comparativo Agrupador Mes' sheets in the Reservas workbook (normally the COPY
     construir_variaciones() just wrote). `mes` decides which year is 'current'. sobrescribir_original defaults to TRUE here,
     unlike the other modules: copying a copy would split the pivots and the matrices across two files.
-    Returns a dict: ruta, anio_actual, anio_anterior, fila_encabezado, filas_base, hojas, tablas, meses_por_anio, advertencias."""
+    Returns a dict: ruta, anio_actual, anio_anterior, fila_encabezado, filas_base, hojas, tablas, meses_por_anio, advertencias,
+    analisis (one summary per sheet that got the %, B/W, % VS YAGO, INDEX rows)."""
     def update_status(mensaje):
         if callback_status:
             callback_status(mensaje)
@@ -466,18 +755,20 @@ def construir_comparativos(
         cache = wb.PivotCaches().Create(SourceType=XL_DATABASE, SourceData=direccion)
 
         ocupados = _nombres_de_tablas(wb)
-        hojas, tablas = [], []
+        hojas, tablas, analisis = [], [], []
         anios = [anio_anterior, anio_actual]     # last year on top, current below
 
         for nombre_hoja, encabezado_hoja, campo_fila, prefijo in COMPARATIVOS:
             update_status(f"🧮 Construyendo '{nombre_hoja}'...")
-            _ws, info, avisos = _construir_hoja(
+            _ws, info, avisos, resumen_analisis = _construir_hoja(
                 wb, cache, nombre_hoja, encabezado_hoja, campo_fila, prefijo,
                 anios, meses_por_anio, ocupados, update_status,
             )
             hojas.append(nombre_hoja)
             tablas.extend(info)
             advertencias.extend(avisos)
+            if resumen_analisis:
+                analisis.append(resumen_analisis)
 
         update_status("💾 Guardando...")
         wb.Save()
@@ -492,6 +783,7 @@ def construir_comparativos(
             "tablas":          tablas,
             "meses_por_anio":  {a: list(m) for a, m in sorted(meses_por_anio.items())},
             "advertencias":    advertencias,
+            "analisis":        analisis,
         }
 
     finally:
